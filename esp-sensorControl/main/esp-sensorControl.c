@@ -31,9 +31,9 @@ static EventGroupHandle_t eth_event_group;
 void obtain_time(void)
 {
     ESP_LOGI(TAG_TIME, "Initializing SNTP...");
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");
-    sntp_init();
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
     time_t now = 0;
     struct tm timeinfo = {0};
     int retry = 0;
@@ -126,14 +126,14 @@ void my_main_task(void *pv)
     while (true)
     {
         send_sensor_data_to_firestore();
-        vTaskDelay(pdMS_TO_TICKS(15000));
+        vTaskDelay(pdMS_TO_TICKS(20000));
     }
 }
 void app_main(void)
 {
     UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
     ESP_LOGI("STACK", "Main task stack remaining: %u bytes", watermark);
-    int msg_id;
+
     // start_ahtxx();
     // xTaskCreate(&poll_temp_task, "poll_temp_task", 4096, NULL, 5, NULL);
     uint8_t eth_port_cnt = 0;
