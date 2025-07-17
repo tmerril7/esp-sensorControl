@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include "firebase.h"
-
+#include <stdbool.h>
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "mbedtls/base64.h"
@@ -19,39 +19,14 @@
 #define MAX_HTTP_OUTPUT_BUFFER 2048
 #define RESPONSE_BUF_SIZE 2048
 
+extern const char FIREBASE_SYSTEM_KEY_pem_start[] asm("_binary_FIREBASE_SYSTEM_KEY_pem_start");
+extern const char FIREBASE_SYSTEM_KEY_pem_end[] asm("_binary_FIREBASE_SYSTEM_KEY_pem_end");
 
-static const char GOOGLE_ROOT_CA_PEM[] =
-    "-----BEGIN CERTIFICATE-----\n"
-    "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\n"
-    "bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c\n"
-    "-----END CERTIFICATE-----\n";
+extern const char G_ROOT_CA_pem_start[] asm("_binary_G_ROOT_CA_pem_start");
+extern const char G_ROOT_CA_pem_end[] asm("_binary_G_ROOT_CA_pem_end");
+
+extern const char GTS_ROOT_R4_pem_start[] asm("_binary_GTS_ROOT_R4_pem_start");
+extern const char GTS_ROOT_R4_pem_end[] asm("_binary_GTS_ROOT_R4_pem_end");
 
 static const char *TAG = "FIREBASE_AUTH";
 float read_fake_sensor_data()
@@ -180,7 +155,7 @@ static esp_err_t sign_jwt_rs256(const char *header_payload, char *out_sig_base64
 
     mbedtls_pk_context pk;
     mbedtls_pk_init(&pk);
-    mbedtls_pk_parse_key(&pk, (const uint8_t *)PRIVATE_KEY_PEM, strlen(PRIVATE_KEY_PEM) + 1, NULL, 0, my_rng, NULL);
+    mbedtls_pk_parse_key(&pk, (const uint8_t *)FIREBASE_SYSTEM_KEY_pem_start, strlen(FIREBASE_SYSTEM_KEY_pem_start) + 1, NULL, 0, my_rng, NULL);
 
     unsigned char hash[32];
     mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
@@ -232,18 +207,18 @@ esp_err_t firebase_get_access_token(char *out_token, size_t max_len)
 
     ESP_LOGI(TAG, "*********************Base64 encoding*******************");
     ESP_LOGI(TAG, "header: %s", header);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_LOGI(TAG, "b64 header: %s", b64_header);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_LOGI(TAG, "payload: %s", payload);
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_LOGI(TAG, "b64 payload: %s", b64_payload);
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    // vTaskDelay(pdMS_TO_TICKS(5000));
     // Combine and sign
     free(payload);
     snprintf(jwt, len_jwt, "%s.%s", b64_header, b64_payload);
     ESP_ERROR_CHECK(sign_jwt_rs256(jwt, signed_b64, len_signed_b64));
-
+    int content_length = 0;
     size_t len_jwt_full = 900;
     char *jwt_full = malloc(len_jwt_full);
     snprintf(jwt_full, len_jwt_full, "%s.%s", jwt, signed_b64);
@@ -254,68 +229,75 @@ esp_err_t firebase_get_access_token(char *out_token, size_t max_len)
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
     cJSON_AddStringToObject(root, "assertion", jwt_full);
-    char *post_data = cJSON_PrintUnformatted(root);
+    size_t len_post_data = 1024;
+    char *post_data = malloc(len_post_data);
+    post_data = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
     ESP_LOGI(TAG, "post len: %u, post data: %s", strlen(post_data), post_data);
     free(jwt_full);
-    // ESP_LOGI(TAG, "google cert: %s", GOOGLE_ROOT_CA_PEM);
-    // ESP_LOGI(TAG, "my key: %s", PRIVATE_KEY_PEM);
-    char response_buf[RESPONSE_BUF_SIZE] = {0};
+
+    char response_buf[RESPONSE_BUF_SIZE + 1] = {0};
+
     esp_http_client_config_t config = {
-        .event_handler = _http_event_handler,
         .url = TOKEN_URL,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 6000,
-        .cert_pem = GOOGLE_ROOT_CA_PEM,
-        .user_data = response_buf};
+        .cert_pem = G_ROOT_CA_pem_start,
+        .timeout_ms = 5000};
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, post_data, strlen(post_data));
-
-    esp_err_t err = esp_http_client_perform(client);
-
-    if (err == ESP_OK)
+    esp_err_t err = esp_http_client_open(client, strlen(post_data));
+    if (err != ESP_OK)
     {
-        int status = esp_http_client_get_status_code(client);
-        int content_len = esp_http_client_get_content_length(client);
-        ESP_LOGI(TAG, "Status = %d, content_length = %d", status, content_len);
-        ESP_LOGI(TAG, "first request was OK!");
-        ESP_LOGI(TAG, "Response: %s", response_buf);
-        // int len = esp_http_client_read_response(client, response_buf, sizeof(buffer) - 1);
-        // buffer[len] = '\0';
-        // ESP_LOGI(TAG, "length of response: %u, full response: %s", len, buffer);
-        cJSON *resp = cJSON_Parse(response_buf);
-        if (resp)
-        {
-            const cJSON *token = cJSON_GetObjectItem(resp, "access_token");
-            if (token)
-            {
-                strncpy(out_token, token->valuestring, max_len - 1);
-                out_token[max_len - 1] = '\0';
-                cJSON_Delete(resp);
-                ESP_LOGI(TAG, "Access token: %s", out_token);
-                esp_http_client_cleanup(client);
-                free(post_data);
-                return ESP_OK;
-            }
-            else
-            {
-                ESP_LOGE(TAG, "No access_token in response!");
-                cJSON_Delete(resp);
-            }
-        }
-        else
-        {
-            ESP_LOGE(TAG, "Failed to parse JSON response");
-        }
-
-        cJSON_Delete(resp);
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
     }
     else
     {
-        ESP_LOGE(TAG, "Token request failed: %s", esp_err_to_name(err));
-    }
+        int wlen = esp_http_client_write(client, post_data, strlen(post_data));
+        if (wlen < 0)
+        {
+            ESP_LOGE(TAG, "Write failed");
+        }
+        content_length = esp_http_client_fetch_headers(client);
+        if (content_length < 0)
+        {
+            ESP_LOGE(TAG, "HTTP client fetch headers failed");
+        }
+        else
+        {
+            int data_read = esp_http_client_read_response(client, response_buf, MAX_HTTP_OUTPUT_BUFFER);
+            if (data_read >= 0)
+            {
+                ESP_LOGI(TAG, "HTTP POST Status = %d, content_length = %" PRId64,
+                         esp_http_client_get_status_code(client),
+                         esp_http_client_get_content_length(client));
+                ESP_LOGI(TAG, "%s", response_buf);
+                cJSON *resp = cJSON_Parse(response_buf);
+                if (resp)
+                {
+                    const cJSON *token = cJSON_GetObjectItem(resp, "access_token");
+                    if (token)
+                    {
+                        strncpy(out_token, token->valuestring, max_len - 1);
+                        out_token[strlen(out_token)] = '\0';
+                        cJSON_Delete(resp);
+                        ESP_LOGI(TAG, "Access token: %s", out_token);
 
+                        // return ESP_OK;
+                    }
+                    else
+                    {
+                        ESP_LOGE(TAG, "No access_token in response!");
+                        cJSON_Delete(resp);
+                    }
+                }
+                else
+                {
+                    ESP_LOGE(TAG, "Token request failed: %s", esp_err_to_name(err));
+                }
+            }
+        }
+    }
     esp_http_client_cleanup(client);
     free(post_data);
     return ESP_FAIL;
@@ -347,11 +329,11 @@ void send_sensor_data_to_firestore()
         .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 5000,
-        .cert_pem = GOOGLE_ROOT_CA_PEM};
+        .cert_pem = G_ROOT_CA_pem_start};
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
-    char access_token[512];
-    char auth_header[1024];
+    char access_token[1500];
+    char auth_header[2048];
 
     watermark = uxTaskGetStackHighWaterMark(NULL);
     ESP_LOGI("STACK_2", "Sub task stack remaining: %u bytes", watermark);
@@ -359,6 +341,10 @@ void send_sensor_data_to_firestore()
     {
         snprintf(auth_header, sizeof(auth_header), "Bearer %s", access_token);
         esp_http_client_set_header(client, "Authorization", auth_header);
+    }
+    else
+    {
+        return;
     }
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, json_str, strlen(json_str));
