@@ -1,4 +1,4 @@
-pinout for Waveshare SPI ethernet:
+### pinout for Waveshare SPI ethernet:
 
 MOSI: 11  
 MISO: 12  
