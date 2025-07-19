@@ -1,4 +1,6 @@
 build/
 managed_components/
 .vscode/
-sdkconfig
+sdkconfig*
+*.pem
+dependencies.lock
