@@ -70,6 +70,11 @@ void obtain_time(void)
 // === Task: Post-IP Setup ===
 void post_ip_task(void *pvParameters)
 {
+
+    ESP_LOGI(TAG_POSTIP, "starting post-ip");
+    UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG_POSTIP, "Sub task stack remaining: %u bytes", watermark);
+
     ESP_LOGI(TAG_POSTIP, "Waiting for IP...");
     xEventGroupWaitBits(eth_event_group, GOT_IP_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 
@@ -92,11 +97,14 @@ void post_ip_task(void *pvParameters)
         ESP_LOGE(TAG_AHT, "ahtxx handle init failed");
         assert(dev_hdl);
     }
+    ESP_LOGI(TAG_POSTIP, "AHT21 initialized");
+    watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG_POSTIP, "Sub task stack remaining: %u bytes", watermark);
 
     // Read and log temperature/humidity
     esp_err_t err = ahtxx_get_measurement(dev_hdl, &temperature, &humidity);
     ESP_LOGI(TAG_AHT, "Temperature: %.2f C, Humidity: %.2f %%", temperature, humidity);
-
+    send_sensor_data_to_firestore(temperature, humidity);
     // TODO Upload to Firebase
     // firebase_upload_temperature(temperature, humidity);
 

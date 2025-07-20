@@ -1,367 +1,511 @@
+/* components/firebase/firebase.c
+ *
+ * Firebase integration for ESP32-S3:
+ *  - Obtain OAuth2 access token via JWT (RS256)
+ *  - Send sensor data to Firestore via REST API
+ */
+
 #include <stdio.h>
-#include "firebase.h"
+#include <string.h>
+#include <time.h>
 #include <stdbool.h>
+#include <sys/param.h>
+
+/* ESP-IDF headers */
 #include "esp_log.h"
+#include "esp_err.h"
 #include "esp_http_client.h"
+#include "esp_tls.h"
+
+/* mbedTLS for JWT signing */
 #include "mbedtls/base64.h"
 #include "mbedtls/md.h"
 #include "mbedtls/pk.h"
+
+/* JSON handling */
 #include "cJSON.h"
-#include <string.h>
-#include <time.h>
-#include "esp_tls.h"
-#include <sys/param.h>
+
+/* Project header */
+#include "firebase.h"
+
+/*=============================================================================
+ *                                CONSTANTS
+ *============================================================================*/
+
+/* OAuth2 token endpoint and scope */
 #define TOKEN_URL "https://oauth2.googleapis.com/token"
 #define SCOPE "https://www.googleapis.com/auth/datastore"
+/* JWT expiration interval (seconds) */
 #define EXPIRATION_SEC 3600
+
+/* Service account / Firestore project */
 #define SERVICE_ACCOUNT_EMAIL "sensorsvc@sensor-control-835f2.iam.gserviceaccount.com"
 #define FIREBASE_PROJECT_ID "sensor-control-835f2"
-#define MAX_HTTP_OUTPUT_BUFFER 2048
-#define RESPONSE_BUF_SIZE 2048
 
+/* HTTP buffer sizes */
+#define MAX_HTTP_OUTPUT_BUFFER 1024
+#define SVC_ACCT_EMAIL_SIZE 75
+#define PROJ_ID_SIZE 50
+
+/*=============================================================================
+ *                           EXTERNALLY EMBEDDED KEYS
+ *============================================================================*/
+
+/* Private key PEM (–start/–end markers come from your CMake embed) */
 extern const char FIREBASE_SYSTEM_KEY_pem_start[] asm("_binary_FIREBASE_SYSTEM_KEY_pem_start");
 extern const char FIREBASE_SYSTEM_KEY_pem_end[] asm("_binary_FIREBASE_SYSTEM_KEY_pem_end");
 
+/* CA certificates for TLS */
 extern const char G_ROOT_CA_pem_start[] asm("_binary_G_ROOT_CA_pem_start");
 extern const char G_ROOT_CA_pem_end[] asm("_binary_G_ROOT_CA_pem_end");
 
-extern const char GTS_ROOT_R4_pem_start[] asm("_binary_GTS_ROOT_R4_pem_start");
-extern const char GTS_ROOT_R4_pem_end[] asm("_binary_GTS_ROOT_R4_pem_end");
+/* Firebase config */
+extern const char firebase_config_json_start[] asm("_binary_firebase_config_json_start");
+extern const char firebase_config_json_end[] asm("_binary_firebase_config_json_end");
 
-static const char *TAG = "FIREBASE_AUTH";
-float read_fake_sensor_data()
-{
-    return (rand() % 1000) / 10.0; // e.g., 0.0 to 99.9
-}
-int my_rng(void *ctx, unsigned char *output, size_t len)
+/*=============================================================================
+ *                             STATIC STATE & TAGS
+ *============================================================================*/
+
+static const char *TAG = "FIREBASE";
+
+/*=============================================================================
+ *                         FORWARD DECLARATIONS
+ *============================================================================*/
+
+/** @brief mbedTLS RNG callback for signing. */
+static int _mbedtls_rng(void *ctx, unsigned char *buf, size_t len);
+
+/** @brief RS256-sign `header.payload` and base64-encode the signature. */
+static esp_err_t _sign_jwt_rs256(const char *header_payload, char *out_sig_b64, size_t sig_len);
+
+/*=============================================================================
+ *                           PRIVATE HELPER FUNCTIONS
+ *============================================================================*/
+
+static int _mbedtls_rng(void *ctx, unsigned char *buf, size_t len)
 {
     (void)ctx;
-    esp_fill_random(output, len);
+    esp_fill_random(buf, len);
     return 0;
 }
 
-esp_err_t _http_event_handler(esp_http_client_event_t *evt)
-{
-    static const char *TAG = "HTTP_EVENT";
-    static char *output_buffer; // Buffer to store response of http request from event handler
-    static int output_len;      // Stores number of bytes read
-    switch (evt->event_id)
-    {
-    case HTTP_EVENT_ERROR:
-        ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
-        break;
-    case HTTP_EVENT_ON_CONNECTED:
-        ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
-        break;
-    case HTTP_EVENT_HEADER_SENT:
-        ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
-        break;
-    case HTTP_EVENT_ON_HEADER:
-        ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
-        break;
-    case HTTP_EVENT_ON_DATA:
-        ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-        // Clean the buffer in case of a new request
-        if (output_len == 0 && evt->user_data)
-        {
-            // we are just starting to copy the output data into the use
-            memset(evt->user_data, 0, MAX_HTTP_OUTPUT_BUFFER);
-        }
-        /*
-         *  Check for chunked encoding is added as the URL for chunked encoding used in this example returns binary data.
-         *  However, event handler can also be used in case chunked encoding is used.
-         */
-        if (!esp_http_client_is_chunked_response(evt->client))
-        {
-            // If user_data buffer is configured, copy the response into the buffer
-            int copy_len = 0;
-            if (evt->user_data)
-            {
-                // The last byte in evt->user_data is kept for the NULL character in case of out-of-bound access.
-                copy_len = MIN(evt->data_len, (MAX_HTTP_OUTPUT_BUFFER - output_len));
-                if (copy_len)
-                {
-                    memcpy(evt->user_data + output_len, evt->data, copy_len);
-                }
-            }
-            else
-            {
-                int content_len = esp_http_client_get_content_length(evt->client);
-                if (output_buffer == NULL)
-                {
-                    // We initialize output_buffer with 0 because it is used by strlen() and similar functions therefore should be null terminated.
-                    output_buffer = (char *)calloc(content_len + 1, sizeof(char));
-                    output_len = 0;
-                    if (output_buffer == NULL)
-                    {
-                        ESP_LOGE(TAG, "Failed to allocate memory for output buffer");
-                        return ESP_FAIL;
-                    }
-                }
-                copy_len = MIN(evt->data_len, (content_len - output_len));
-                if (copy_len)
-                {
-                    memcpy(output_buffer + output_len, evt->data, copy_len);
-                }
-            }
-            output_len += copy_len;
-        }
-
-        break;
-    case HTTP_EVENT_ON_FINISH:
-        ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
-        if (output_buffer != NULL)
-        {
-#if CONFIG_EXAMPLE_ENABLE_RESPONSE_BUFFER_DUMP
-            ESP_LOG_BUFFER_HEX(TAG, output_buffer, output_len);
-#endif
-            free(output_buffer);
-            output_buffer = NULL;
-        }
-        output_len = 0;
-        break;
-    case HTTP_EVENT_DISCONNECTED:
-        ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
-        int mbedtls_err = 0;
-        esp_err_t err = esp_tls_get_and_clear_last_error((esp_tls_error_handle_t)evt->data, &mbedtls_err, NULL);
-        if (err != 0)
-        {
-            ESP_LOGI(TAG, "Last esp error code: 0x%x", err);
-            ESP_LOGI(TAG, "Last mbedtls failure: 0x%x", mbedtls_err);
-        }
-        if (output_buffer != NULL)
-        {
-            free(output_buffer);
-            output_buffer = NULL;
-        }
-        output_len = 0;
-        break;
-    case HTTP_EVENT_REDIRECT:
-        ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
-        esp_http_client_set_header(evt->client, "From", "user@example.com");
-        esp_http_client_set_header(evt->client, "Accept", "text/html");
-        esp_http_client_set_redirection(evt->client);
-        break;
-    }
-    return ESP_OK;
-}
-static esp_err_t sign_jwt_rs256(const char *header_payload, char *out_sig_base64, size_t sig_len)
+static esp_err_t _sign_jwt_rs256(const char *header_payload,
+                                 char *out_sig_b64,
+                                 size_t sig_len)
 {
 
-    int ret;
-    size_t sig_actual = 0;
-    size_t len_sig = 512;
-    unsigned char *sig = malloc(len_sig);
+    UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI("firebase_stack", "Sub task stack remaining: %u bytes", watermark);
 
     mbedtls_pk_context pk;
     mbedtls_pk_init(&pk);
-    mbedtls_pk_parse_key(&pk, (const uint8_t *)FIREBASE_SYSTEM_KEY_pem_start, strlen(FIREBASE_SYSTEM_KEY_pem_start) + 1, NULL, 0, my_rng, NULL);
 
+    /* Parse the service account private key */
+    int ret = mbedtls_pk_parse_key(&pk,
+                                   (const unsigned char *)FIREBASE_SYSTEM_KEY_pem_start,
+                                   FIREBASE_SYSTEM_KEY_pem_end - FIREBASE_SYSTEM_KEY_pem_start,
+                                   NULL, 0, _mbedtls_rng, NULL);
+    if (ret)
+    {
+        ESP_LOGE(TAG, "Private key parse failed: %d", ret);
+        mbedtls_pk_free(&pk);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "key is parsed");
+    watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI("firebase_stack", "Sub task stack remaining: %u bytes", watermark);
+
+    /* SHA256 hash of header.payload */
     unsigned char hash[32];
     mbedtls_md(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-               (const unsigned char *)header_payload, strlen(header_payload), hash);
+               (const unsigned char *)header_payload,
+               strlen(header_payload),
+               hash);
+    ESP_LOGI(TAG, "hash is created");
+    watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI("firebase_stack", "Sub task stack remaining: %u bytes", watermark);
 
-    ret = mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig, len_sig, &sig_actual, my_rng, NULL);
-    if (ret != 0)
+/* Sign the hash */
+#define LEN_SIG 512
+    unsigned char *sig = malloc(LEN_SIG);
+    size_t sig_actual = 0;
+    ret = mbedtls_pk_sign(&pk, MBEDTLS_MD_SHA256,
+                          hash, sizeof(hash),
+                          sig, LEN_SIG, &sig_actual,
+                          _mbedtls_rng, NULL);
+    mbedtls_pk_free(&pk);
+    if (ret)
     {
-        ESP_LOGE(TAG, "RSA Sign failed: %d", ret);
+        ESP_LOGE(TAG, "RSA sign failed: %d", ret);
         return ESP_FAIL;
     }
 
-    size_t olen = 0;
-    mbedtls_base64_encode((unsigned char *)out_sig_base64, sig_len, &olen, sig, sig_actual);
-    free(sig);
-    out_sig_base64[olen] = '\0';
+    ESP_LOGI(TAG, "hash is signed");
+    watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI("firebase_stack", "Sub task stack remaining: %u bytes", watermark);
 
-    mbedtls_pk_free(&pk);
+    /* Base64-encode the signature */
+    size_t olen = 0;
+    mbedtls_base64_encode((unsigned char *)out_sig_b64,
+                          sig_len, &olen,
+                          sig, sig_actual);
+    out_sig_b64[olen] = '\0';
+
+    ESP_LOGI(TAG, "signature is base64 encoded");
+    free(sig);
     return ESP_OK;
 }
 
-esp_err_t firebase_get_access_token(char *out_token, size_t max_len)
+/*=============================================================================
+ *                           PUBLIC API FUNCTIONS
+ *============================================================================*/
+
+/**
+ * @brief  Obtain (and cache until expiry) a Firebase OAuth2 access token.
+ * @param  out_token   Buffer to receive the access token string.
+ * @param  max_len     Maximum length of `out_token`.
+ * @param  svc_acct_email  Service account email string.
+ * @return ESP_OK on success, otherwise an ESP error.
+ */
+esp_err_t firebase_get_access_token(char *out_token, size_t max_len, char *svc_acct_email)
 {
+    ESP_LOGI(TAG, "Requesting access token...");
 
-    ESP_LOGI(TAG, "*********************Getting access token*******************");
-    // char jwt[320];
-    size_t len_jwt = 1024;
-    char *jwt = malloc(len_jwt);
-    size_t len_signed_b64 = 1024;
-    char *signed_b64 = malloc(len_signed_b64);
-
+    /* Build JWT header and payload */
     time_t now = time(NULL);
-    ESP_LOGI(TAG, "time: %llu", now);
     time_t exp = now + EXPIRATION_SEC;
 
-    // Create JWT Header and Payload
-    char header[] = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
-    size_t len_payload = 512;
-    char *payload = malloc(len_payload);
-    snprintf(payload, len_payload,
+    /* 1) Base64(header) */
+    const char hdr[] = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
+    char hdr_b64[64];
+    size_t hdr_b64_len;
+    mbedtls_base64_encode((unsigned char *)hdr_b64,
+                          sizeof(hdr_b64), &hdr_b64_len,
+                          (const unsigned char *)hdr, strlen(hdr));
+    hdr_b64[hdr_b64_len] = '\0';
+
+/* 2) Base64(payload) */
+#define PAYLOAD_SIZE 512
+    char *payload = malloc(PAYLOAD_SIZE);
+    snprintf(payload, PAYLOAD_SIZE,
              "{\"iss\":\"%s\",\"scope\":\"%s\",\"aud\":\"%s\",\"iat\":%lld,\"exp\":%lld}",
-             SERVICE_ACCOUNT_EMAIL, SCOPE, TOKEN_URL, now, exp);
-    ESP_LOGI(TAG, "%s", payload);
-    // Base64 encode header and payload
-    char b64_header[64], b64_payload[512];
-    size_t olen = 0;
-    mbedtls_base64_encode((unsigned char *)b64_header, sizeof(b64_header), &olen, (unsigned char *)header, strlen(header));
-    mbedtls_base64_encode((unsigned char *)b64_payload, sizeof(b64_payload), &olen, (unsigned char *)payload, strlen(payload));
-
-    ESP_LOGI(TAG, "*********************Base64 encoding*******************");
-    ESP_LOGI(TAG, "header: %s", header);
-    // vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "b64 header: %s", b64_header);
-    // vTaskDelay(pdMS_TO_TICKS(1000));
+             svc_acct_email, SCOPE, TOKEN_URL,
+             (long long)now, (long long)exp);
     ESP_LOGI(TAG, "payload: %s", payload);
-    // vTaskDelay(pdMS_TO_TICKS(1000));
-    ESP_LOGI(TAG, "b64 payload: %s", b64_payload);
-    // vTaskDelay(pdMS_TO_TICKS(5000));
-    // Combine and sign
+#define PAYLOAD_B64_SIZE 512
+    char *payload_b64 = malloc(PAYLOAD_B64_SIZE);
+    size_t payload_b64_len;
+    mbedtls_base64_encode((unsigned char *)payload_b64,
+                          PAYLOAD_B64_SIZE, &payload_b64_len,
+                          (const unsigned char *)payload, strlen(payload));
+    payload_b64[payload_b64_len] = '\0';
+    ESP_LOGI(TAG, "%s", payload_b64);
     free(payload);
-    snprintf(jwt, len_jwt, "%s.%s", b64_header, b64_payload);
-    ESP_ERROR_CHECK(sign_jwt_rs256(jwt, signed_b64, len_signed_b64));
-    int content_length = 0;
-    size_t len_jwt_full = 900;
-    char *jwt_full = malloc(len_jwt_full);
-    snprintf(jwt_full, len_jwt_full, "%s.%s", jwt, signed_b64);
-    ESP_LOGI(TAG, "jwt_full: %s", jwt_full);
-    free(jwt);
-    free(signed_b64);
-    // Build HTTP POST
+
+/* 3) Sign header.payload */
+#define HEADER_PAYLOAD_SIZE 1024
+    char *header_payload = malloc(HEADER_PAYLOAD_SIZE);
+    snprintf(header_payload, HEADER_PAYLOAD_SIZE, "%s.%s", hdr_b64, payload_b64);
+    ESP_LOGI(TAG, "%s", header_payload);
+    free(payload_b64);
+
+#define SIG_B64_SIZE 1024
+    char *sig_b64 = malloc(SIG_B64_SIZE);
+    _sign_jwt_rs256(header_payload, sig_b64, SIG_B64_SIZE);
+
+/* 4) Complete JWT */
+#define JWT_SIZE 1024
+    char *jwt = malloc(JWT_SIZE);
+    snprintf(jwt, JWT_SIZE, "%s.%s", header_payload, sig_b64);
+    free(header_payload);
+    free(sig_b64);
+    ESP_LOGI(TAG, "%s", jwt);
+
+    /* 5) Prepare OAuth2 POST body */
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
-    cJSON_AddStringToObject(root, "assertion", jwt_full);
-    size_t len_post_data = 1024;
-    char *post_data = malloc(len_post_data);
-    post_data = cJSON_PrintUnformatted(root);
+    cJSON_AddStringToObject(root, "grant_type",
+                            "urn:ietf:params:oauth:grant-type:jwt-bearer");
+    cJSON_AddStringToObject(root, "assertion", jwt);
+    free(jwt);
+#define POST_DATA_SIZE 1024
+    char *post_data = malloc(POST_DATA_SIZE);
+    snprintf(post_data, POST_DATA_SIZE, "%s", cJSON_PrintUnformatted(root));
+    ESP_LOGI(TAG, "Post Data: %s", post_data);
     cJSON_Delete(root);
-    ESP_LOGI(TAG, "post len: %u, post data: %s", strlen(post_data), post_data);
-    free(jwt_full);
 
-    char response_buf[RESPONSE_BUF_SIZE + 1] = {0};
-
+    /* 6) Perform HTTP POST */
     esp_http_client_config_t config = {
         .url = TOKEN_URL,
+        .timeout_ms = 5000,
         .cert_pem = G_ROOT_CA_pem_start,
-        .timeout_ms = 5000};
-
+    };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "application/json");
+    esp_http_client_set_post_field(client, post_data, strlen(post_data));
     esp_err_t err = esp_http_client_open(client, strlen(post_data));
+
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return err;
     }
-    else
-    {
-        int wlen = esp_http_client_write(client, post_data, strlen(post_data));
-        if (wlen < 0)
-        {
-            ESP_LOGE(TAG, "Write failed");
-        }
-        content_length = esp_http_client_fetch_headers(client);
-        if (content_length < 0)
-        {
-            ESP_LOGE(TAG, "HTTP client fetch headers failed");
-        }
-        else
-        {
-            int data_read = esp_http_client_read_response(client, response_buf, MAX_HTTP_OUTPUT_BUFFER);
-            if (data_read >= 0)
-            {
-                ESP_LOGI(TAG, "HTTP POST Status = %d, content_length = %" PRId64,
-                         esp_http_client_get_status_code(client),
-                         esp_http_client_get_content_length(client));
-                ESP_LOGI(TAG, "%s", response_buf);
-                cJSON *resp = cJSON_Parse(response_buf);
-                if (resp)
-                {
-                    const cJSON *token = cJSON_GetObjectItem(resp, "access_token");
-                    if (token)
-                    {
-                        strncpy(out_token, token->valuestring, max_len - 1);
-                        out_token[strlen(out_token)] = '\0';
-                        cJSON_Delete(resp);
-                        ESP_LOGI(TAG, "Access token: %s", out_token);
 
-                        // return ESP_OK;
-                    }
-                    else
-                    {
-                        ESP_LOGE(TAG, "No access_token in response!");
-                        cJSON_Delete(resp);
-                    }
-                }
-                else
-                {
-                    ESP_LOGE(TAG, "Token request failed: %s", esp_err_to_name(err));
-                }
-            }
-        }
-    }
-    esp_http_client_cleanup(client);
+    int wlen = esp_http_client_write(client, post_data, strlen(post_data));
     free(post_data);
-    return ESP_FAIL;
+    if (wlen < 0)
+    {
+        ESP_LOGE(TAG, "Write failed");
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+
+    int resp_headers_len = esp_http_client_fetch_headers(client);
+    if (resp_headers_len < 0)
+    {
+        ESP_LOGE(TAG, "HTTP client fetch headers failed");
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+#define RESPONSE_BUFFER_SIZE 2048
+    char *response_buffer = malloc(RESPONSE_BUFFER_SIZE + 1);
+    int response_content_len = esp_http_client_read_response(client, response_buffer, RESPONSE_BUFFER_SIZE);
+    if (response_content_len < 0)
+    {
+        ESP_LOGE(TAG, "No response from HTTP request");
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+    response_buffer[response_content_len] = '\0';
+
+    ESP_LOGI(TAG, "HTTP POST Status = %d, content_length = %" PRId64,
+             esp_http_client_get_status_code(client),
+             esp_http_client_get_content_length(client));
+    ESP_LOGI(TAG, "%s", response_buffer);
+    esp_http_client_cleanup(client);
+
+    /* 7) Parse JSON response */
+    cJSON *resp_json = cJSON_Parse(response_buffer);
+    free(response_buffer);
+    if (!resp_json)
+    {
+        ESP_LOGE(TAG, "Failed to parse token JSON");
+        return ESP_FAIL;
+    }
+    cJSON *token_item = cJSON_GetObjectItem(resp_json, "access_token");
+    if (!token_item)
+    {
+        ESP_LOGE(TAG, "No access_token in response");
+        cJSON_Delete(resp_json);
+        return ESP_FAIL;
+    }
+    strlcpy(out_token, token_item->valuestring, max_len);
+    cJSON_Delete(resp_json);
+
+    ESP_LOGI(TAG, "Access token obtained successfully");
+    return ESP_OK;
 }
 
-void send_sensor_data_to_firestore()
+bool get_json_string(const cJSON *root, const char *key, char *out_buf, size_t buf_len)
 {
-    UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGI("STACK_2", "Sub task stack remaining: %u bytes", watermark);
-    char url[256];
-    snprintf(url, sizeof(url),
-             "https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents/sensor_data",
-             FIREBASE_PROJECT_ID);
-
-    float value = read_fake_sensor_data();
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON *fields = cJSON_CreateObject();
-    cJSON *temp = cJSON_CreateObject();
-
-    cJSON_AddStringToObject(temp, "doubleValue", cJSON_PrintUnformatted(cJSON_CreateNumber(value)));
-    cJSON_AddItemToObject(fields, "temperature", temp);
-    cJSON_AddItemToObject(root, "fields", fields);
-
-    char *json_str = cJSON_PrintUnformatted(root);
-    ESP_LOGI(TAG, "POST JSON: %s", json_str);
-
-    esp_http_client_config_t config = {
-        .url = url,
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 5000,
-        .cert_pem = G_ROOT_CA_pem_start};
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    char access_token[1500];
-    char auth_header[2048];
-
-    watermark = uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGI("STACK_2", "Sub task stack remaining: %u bytes", watermark);
-    if (firebase_get_access_token(access_token, sizeof(access_token)) == ESP_OK)
+    // 1) Find the item
+    cJSON *item = cJSON_GetObjectItem(root, key);
+    if (!item)
     {
-        snprintf(auth_header, sizeof(auth_header), "Bearer %s", access_token);
-        esp_http_client_set_header(client, "Authorization", auth_header);
+        // key not found
+        return false;
     }
-    else
+
+    // 2) Verify it’s a string
+    if (!cJSON_IsString(item) || (item->valuestring == NULL))
     {
+        // wrong type
+        return false;
+    }
+
+    // 3) Copy safely into your buffer
+    // Option A: snprintf (always null‑terminates)
+    snprintf(out_buf, buf_len, "%s", item->valuestring);
+
+    return true;
+}
+
+/**
+ * @brief  Send a single sensor reading to Firestore under `sensor_data` collection.
+ */
+void send_sensor_data_to_firestore(float temp, float hum)
+{
+    // pull in firebase configuration from JSON file
+    size_t len = firebase_config_json_end - firebase_config_json_start;
+    char *buf = malloc(len + 1);
+    if (!buf)
+    {
+        ESP_LOGE(TAG, "Out of memory");
         return;
     }
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, json_str, strlen(json_str));
+    memcpy(buf, firebase_config_json_start, len);
+    buf[len] = '\0'; // null‑terminate
 
-    esp_err_t err = esp_http_client_perform(client);
-
-    if (err == ESP_OK)
+    // Parse with cJSON
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root)
     {
-        ESP_LOGI(TAG, "Data sent to Firestore. HTTP Status = %d",
-                 esp_http_client_get_status_code(client));
-    }
-    else
-    {
-        ESP_LOGE(TAG, "HTTP POST failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "JSON parse error");
+        return;
     }
 
-    esp_http_client_cleanup(client);
+    ESP_LOGI(TAG, "parsed config JSON");
+    UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "Sub task stack remaining: %u bytes", watermark);
+
+    // extract svc_acct_email from config
+    char svc_acct_email[SVC_ACCT_EMAIL_SIZE];
+    if (!get_json_string(root, "svc_acct_email", svc_acct_email, sizeof(svc_acct_email)))
+    {
+        ESP_LOGE(TAG, "Failed to get svc_acct_email");
+        return;
+    }
+
+    ESP_LOGI(TAG, "extracted svc_acct_email");
+    watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "Sub task stack remaining: %u bytes", watermark);
+
+    // extract proj_id from config
+    char proj_id[PROJ_ID_SIZE];
+    if (!get_json_string(root, "project_id", proj_id, sizeof(proj_id)))
+    {
+        ESP_LOGE(TAG, "Failed to get project_id");
+        return;
+    }
+
+    ESP_LOGI(TAG, "extracted proj_id");
+    watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "Sub task stack remaining: %u bytes", watermark);
+
     cJSON_Delete(root);
+
+// get access token
+#define TOKEN_SIZE 1200
+    char *token = malloc(TOKEN_SIZE);
+    if (firebase_get_access_token(token, TOKEN_SIZE - 1, svc_acct_email) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Cannot obtain access token, aborting send");
+        return;
+    }
+
+    char *auth_header = malloc(TOKEN_SIZE - 20);
+    snprintf(auth_header, TOKEN_SIZE - 20 - 1, "Bearer %s", token);
+    free(token);
+
+    /* Build Firestore REST endpoint URL */
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://firestore.googleapis.com/v1/projects/%s/"
+             "databases/(default)/documents/sensor_data",
+             proj_id);
+
+    /* Create Firestore document JSON */
+
+    time_t ts = time(NULL);
+
+    cJSON *doc = cJSON_CreateObject();
+    cJSON *fields = cJSON_AddObjectToObject(doc, "fields");
+
+    /* timestamp as integerValue */
+    char ts_str[32];
+    snprintf(ts_str, sizeof(ts_str), "%lld", (long long)ts);
+    cJSON *time_obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(time_obj, "integerValue", ts_str);
+    cJSON_AddItemToObject(fields, "timestamp", time_obj);
+
+    /* temperature as doubleValue */
+    cJSON *val_obj = cJSON_CreateObject();
+    char val_str[16];
+    snprintf(val_str, sizeof(val_str), "%.2f", temp);
+    cJSON_AddStringToObject(val_obj, "doubleValue", val_str);
+    cJSON_AddItemToObject(fields, "temp", val_obj);
+
+    /* humidity as doubleValue*/
+    val_obj = cJSON_CreateObject();
+    snprintf(val_str, sizeof(val_str), "%.2f", hum);
+    cJSON_AddStringToObject(val_obj, "doubleValue", val_str);
+    cJSON_AddItemToObject(fields, "humidity", val_obj);
+
+#define SENSOR_DATA_SIZE 256
+    char *json_str = malloc(SENSOR_DATA_SIZE);
+    snprintf(json_str, SENSOR_DATA_SIZE - 1, "%s", cJSON_PrintUnformatted(doc));
+    cJSON_Delete(doc);
+    ESP_LOGI(TAG, "Sensor data: %s", json_str);
+
+    /* Perform HTTP POST */
+    esp_http_client_config_t config = {
+        .url = url,
+        .cert_pem = G_ROOT_CA_pem_start,
+        .timeout_ms = 5000,
+        .buffer_size_tx = 2048,
+        .buffer_size = 2048};
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    ESP_LOGI(TAG, "Set first header");
+    watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "Setting Headers ----Sub task stack remaining: %u bytes", watermark);
+    if (esp_http_client_set_header(client, "Authorization", auth_header) != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to set first header");
+    }
+    ESP_LOGI(TAG, "Set second header");
+
+    if (esp_http_client_set_header(client, "Content-Type", "application/json") != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to set second header");
+    }
+    // ***Delete? esp_http_client_set_post_field(client, json_str, strlen(json_str));
+    watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "Opening connections ----Sub task stack remaining: %u bytes", watermark);
+
+    esp_err_t err = esp_http_client_open(client, strlen(json_str));
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        return;
+    }
+
+    watermark = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "Writing request----Sub task stack remaining: %u bytes", watermark);
+
+    int wlen = esp_http_client_write(client, json_str, strlen(json_str));
+    if (wlen <= 0)
+    {
+        ESP_LOGE(TAG, "Write failed");
+        return;
+    }
+    ESP_LOGI(TAG, "Wrote %u bytes", wlen);
+
+    int resp_header_len = esp_http_client_fetch_headers(client);
+    if (resp_header_len < 0)
+    {
+        ESP_LOGE(TAG, "HTTP client fetch headers failed");
+        // return;
+    }
+    ESP_LOGI(TAG, "%u bytes in response headers", resp_header_len);
+
+#define FIRESTORE_RESPONSE_BUFFER_SIZE 2048
+    char *firestore_resp_buffer = malloc(FIRESTORE_RESPONSE_BUFFER_SIZE);
+    int data_read = esp_http_client_read_response(client, firestore_resp_buffer, FIRESTORE_RESPONSE_BUFFER_SIZE - 1);
+    if (data_read <= 0)
+    {
+        ESP_LOGE(TAG, "Failed to read http request response");
+        return;
+    }
+    ESP_LOGI(TAG, "read %u bytes", data_read);
+    ESP_LOGI(TAG, "Status Code: %u", esp_http_client_get_status_code(client));
+    esp_http_client_cleanup(client);
+
+    free(auth_header);
     free(json_str);
+    free(firestore_resp_buffer);
 }
