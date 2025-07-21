@@ -86,8 +86,9 @@ void setup_averaging(void)
 static void sample_timer_cb(TimerHandle_t xTimer)
 {
     esp_err_t err = ahtxx_get_measurement(dev_hdl, &temperature, &humidity);
+
     if (err == ESP_OK) {
-        window_sum   += temperature;
+        window_sum   += (temperature * 9.0/5.0) + 32.0;
         window_count += 1;
         ESP_LOGD(TAG, "Sampled: %.2f  (sum=%.2f count=%"PRIu32")",
                  temperature, window_sum, window_count);
