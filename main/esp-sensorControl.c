@@ -2,9 +2,11 @@
 
 #include <stdio.h>
 #include <time.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "freertos/event_groups.h"
 
 #include "driver/gpio.h"
@@ -16,7 +18,7 @@
 #include "esp_sntp.h"
 
 #include "ethernet_init.h"
- #include "mqtt_man.h"
+#include "mqtt_man.h"
 #include "mqtt_client.h"
 #include "ahtxx.h"
 #include "firebase.h"
@@ -24,17 +26,135 @@
 // === Defines ===
 #define GOT_IP_BIT BIT0
 #define STACK_SIZE 10240
+#define SAMPLE_INTERVAL_MS    5000    // read sensor every 5 s
+#define WINDOW_INTERVAL_MS   60000    // average window = 60 s
+#define BATCH_SIZE               5
 
 // === Logging Tags ===
 static const char *TAG_ETH = "ETH";
 static const char *TAG_NTP = "SNTP";
 static const char *TAG_AHT = "AHTSensor";
 static const char *TAG_POSTIP = "PostIPTask";
+static const char *TAG = "Averaging";
 
 // === Globals ===
 static EventGroupHandle_t eth_event_group;
 ahtxx_handle_t dev_hdl;
 float temperature, humidity;
+static float window_sum;
+static uint32_t window_count;
+
+/* Structure for holding an averaged reading */
+typedef struct {
+    time_t timestamp;
+    float  average;
+} avg_sample_t;
+
+/* Simple in-RAM circular buffer for a batch of averages */
+static avg_sample_t batch_buffer[BATCH_SIZE];
+static uint8_t      batch_index;
+
+/* Forward declarations */
+static void sample_timer_cb(TimerHandle_t xTimer);
+static void window_timer_cb(TimerHandle_t xTimer);
+static void send_batch(void);
+
+/* Create two timers in app_main() or initialization routine: */
+void setup_averaging(void)
+{
+    TimerHandle_t sample_timer = xTimerCreate(
+        "sampleTimer", pdMS_TO_TICKS(SAMPLE_INTERVAL_MS),
+        pdTRUE,  NULL, sample_timer_cb);
+    TimerHandle_t window_timer = xTimerCreate(
+        "windowTimer", pdMS_TO_TICKS(WINDOW_INTERVAL_MS),
+        pdTRUE,  NULL, window_timer_cb);
+
+    if (sample_timer == NULL || window_timer == NULL) {
+        ESP_LOGE(TAG, "Timer creation failed");
+        return;
+    }
+    xTimerStart(sample_timer, 0);
+    xTimerStart(window_timer, 0);
+}
+
+/* ----------------------------------------------------------------------------
+ * sample_timer_cb
+ *   Runs every SAMPLE_INTERVAL_MS:
+ *   - Reads AHT21
+ *   - Accumulates into window_sum and window_count
+ * ------------------------------------------------------------------------- */
+static void sample_timer_cb(TimerHandle_t xTimer)
+{
+    esp_err_t err = ahtxx_get_measurement(dev_hdl, &temperature, &humidity);
+    if (err == ESP_OK) {
+        window_sum   += temperature;
+        window_count += 1;
+        ESP_LOGD(TAG, "Sampled: %.2f  (sum=%.2f count=%"PRIu32")",
+                 temperature, window_sum, window_count);
+    } else {
+        ESP_LOGW(TAG, "Sensor read failed: %s", esp_err_to_name(err));
+    }
+}
+
+/* ----------------------------------------------------------------------------
+ * window_timer_cb
+ *   Runs every WINDOW_INTERVAL_MS:
+ *   - Computes average
+ *   - Resets sum/count
+ *   - Appends to batch_buffer
+ *   - If buffer full, calls send_batch()
+ * ------------------------------------------------------------------------- */
+static void window_timer_cb(TimerHandle_t xTimer)
+{
+    if (window_count == 0) {
+        ESP_LOGW(TAG, "No samples in this window");
+        return;
+    }
+
+    /* Compute average and reset */
+    float avg = window_sum / (float)window_count;
+    window_sum   = 0;
+    window_count = 0;
+
+    /* Record timestamped average */
+    time_t now = time(NULL);
+    batch_buffer[batch_index].timestamp = now;
+    batch_buffer[batch_index].average   = avg;
+    batch_index++;
+
+    ESP_LOGI(TAG, "Window avg: %.2f at %lld  (buffer=%u/%u)",
+             avg, (long long)now, batch_index, BATCH_SIZE);
+
+    /* If we’ve collected enough, send them */
+    if (batch_index >= BATCH_SIZE) {
+        //send_batch();
+        batch_index = 0;
+    }
+}
+
+/* ----------------------------------------------------------------------------
+ * send_batch
+ *   Iterates buffered averages and sends each to Firestore
+ *   (you could also build a single batched JSON payload if you prefer)
+ * ------------------------------------------------------------------------- */
+static void send_batch(void)
+{
+    ESP_LOGI(TAG, "Sending batch of %u samples", BATCH_SIZE);
+
+    // for (uint8_t i = 0; i < BATCH_SIZE; i++) {
+    //     avg_sample_t *s = &batch_buffer[i];
+
+    //     /* Option A: modify your existing function to accept parameters */
+    //     // send_sensor_data_to_firestore(s->timestamp, s->average);
+
+    //     /* Option B: temporarily set a global or use a struct */
+    //     set_fake_sensor_data(s->average);       // if your send fn reads from a global
+    //     override_timestamp(s->timestamp);       // likewise for timestamp
+    //     send_sensor_data_to_firestore();        // existing no-arg sender
+
+    //     vTaskDelay(pdMS_TO_TICKS(100));         // small delay to avoid back-to-back HTTP
+    // }
+}
 
 // === Function: Time Sync ===
 void obtain_time(void)
@@ -104,10 +224,10 @@ void post_ip_task(void *pvParameters)
     // Read and log temperature/humidity
     esp_err_t err = ahtxx_get_measurement(dev_hdl, &temperature, &humidity);
     ESP_LOGI(TAG_AHT, "Temperature: %.2f C, Humidity: %.2f %%", temperature, humidity);
-    send_sensor_data_to_firestore(temperature, humidity);
+    //send_sensor_data_to_firestore(temperature, humidity);
     // TODO Upload to Firebase
     // firebase_upload_temperature(temperature, humidity);
-
+    setup_averaging();
     vTaskDelete(NULL);
 }
 
