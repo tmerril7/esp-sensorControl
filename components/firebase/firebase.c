@@ -37,10 +37,7 @@
 #define SCOPE "https://www.googleapis.com/auth/datastore"
 /* JWT expiration interval (seconds) */
 #define EXPIRATION_SEC 3600
-
-/* Service account / Firestore project */
-#define SERVICE_ACCOUNT_EMAIL "sensorsvc@sensor-control-835f2.iam.gserviceaccount.com"
-#define FIREBASE_PROJECT_ID "sensor-control-835f2"
+#define TOKEN_REFRESH_MARGIN 60
 
 /* HTTP buffer sizes */
 #define MAX_HTTP_OUTPUT_BUFFER 1024
@@ -68,6 +65,8 @@ extern const char firebase_config_json_end[] asm("_binary_firebase_config_json_e
  *============================================================================*/
 
 static const char *TAG = "FIREBASE";
+static char cached_token[1200] = {0};
+static time_t chached_expiry = 0;
 
 /*=============================================================================
  *                         FORWARD DECLARATIONS
@@ -175,6 +174,17 @@ esp_err_t firebase_get_access_token(char *out_token, size_t max_len, char *svc_a
     /* Build JWT header and payload */
     time_t now = time(NULL);
     time_t exp = now + EXPIRATION_SEC;
+
+    /* -----check for existing token----- */
+    if (cached_token[0] != '\0' && now < (cached_expiry - TOKEN_REFRESH_MARGIN))
+    {
+        ESP_LOGD(TAG, "Reusing valid token, expires in %llds",
+                 (long long)(cached_expiry - now));
+        strlcpy(out_token, cached_token, max_len);
+        return ESP_OK;
+    }
+    ESP_LOGI(TAG, "Token expired or missing (now=%lld, expiry=%lld), fetching new one",
+             (long long)now, (long long)cached_expiry);
 
     /* 1) Base64(header) */
     const char hdr[] = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
@@ -294,15 +304,38 @@ esp_err_t firebase_get_access_token(char *out_token, size_t max_len, char *svc_a
         ESP_LOGE(TAG, "Failed to parse token JSON");
         return ESP_FAIL;
     }
-    cJSON *token_item = cJSON_GetObjectItem(resp_json, "access_token");
-    if (!token_item)
+    cJSON *token_item_token = cJSON_GetObjectItem(resp_json, "access_token");
+    if (!token_item_token)
     {
         ESP_LOGE(TAG, "No access_token in response");
         cJSON_Delete(resp_json);
+        cJSON_Delete(token_item_token);
         return ESP_FAIL;
     }
-    strlcpy(out_token, token_item->valuestring, max_len);
+    cJSON *token_item_expires_in = cJSON_GetObjectItem(resp_json, "expires_in");
+    if (!token_item_expires_in)
+    {
+        ESP_LOGE(TAG, "No expiration in response");
+        cJSON_Delete(resp_json);
+        cJSON_Delete(token_item_token);
+        cJSON_Delete(token_item_expires_in);
+        return ESP_FAIL;
+    }
+
+    strlcpy(cached_token, token_item_token->valuestring, max_len);
+    strlcpy(out_token, cached_token, max_len);
+    if (!cJSON_IsNumber(token_item_expires_in))
+    {
+        ESP_LOGE(TAG, "response didn't have expires_in, couldn't save token");
+        cached_token[0] = '\0';
+    }
+    else
+    {
+        cached_expiry = now + (time_t)token_item_expire_in->valuedouble;
+    }
     cJSON_Delete(resp_json);
+    cJSON_Delete(token_item_token);
+    cJSON_Delete(token_item_expires_in);
 
     ESP_LOGI(TAG, "Access token obtained successfully");
     return ESP_OK;
