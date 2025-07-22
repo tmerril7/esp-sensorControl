@@ -224,6 +224,38 @@ void post_ip_task(void *pvParameters)
 
     obtain_time();
 
+    // Startup MQTT
+    static bool have_all_config = true;
+
+    static const char *mqtt_url[BROKER_URL_SIZE];
+    if (!load_config_str("mqtt_url", mqtt_url, BROKER_URL_SIZE - 1, "default-config"))
+    {
+        have_all_config = false;
+    }
+
+    static const char *mqtt_username[MQTT_USERNAME_SIZE];
+    if (!load_config_str("mqtt_username", mqtt_username, MQTT_USERNAME_SIZE - 1, "default-config"))
+    {
+        have_all_config = false;
+    }
+
+    static const char *mqtt_password[MQTT_PASSWORD_SIZE];
+    if (load_config_str("mqtt_password", mqtt_password, MQTT_PASSWORD_SIZE - 1, "default-config"))
+    {
+        have_all_config = false;
+    }
+
+    static const char *verification_cert[MQTT_CERT_SIZE];
+    if (load_config_str("verification_cert", verification_cert, MQTT_CERT_SIZE - 1, "default-config"))
+    {
+        have_all_config = false;
+    }
+
+    if (have_all_config)
+    {
+        mqtt_app_start(mqtt_url, mqtt_username, mqtt_password, verification_cert);
+    }
+
     // Initialize AHT21 sensor
     ESP_LOGI(TAG_AHT, "Initializing AHT21 sensor");
     ahtxx_config_t dev_cfg = I2C_AHT21_CONFIG_DEFAULT;
