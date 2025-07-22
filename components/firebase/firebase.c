@@ -16,6 +16,8 @@
 #include "esp_err.h"
 #include "esp_http_client.h"
 #include "esp_tls.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 /* mbedTLS for JWT signing */
 #include "mbedtls/base64.h"
@@ -27,6 +29,9 @@
 
 /* Project header */
 #include "firebase.h"
+
+/* My modules*/
+#include "nvs_helper.h"
 
 /*=============================================================================
  *                                CONSTANTS
@@ -55,10 +60,6 @@ extern const char FIREBASE_SYSTEM_KEY_pem_end[] asm("_binary_FIREBASE_SYSTEM_KEY
 /* CA certificates for TLS */
 extern const char G_ROOT_CA_pem_start[] asm("_binary_G_ROOT_CA_pem_start");
 extern const char G_ROOT_CA_pem_end[] asm("_binary_G_ROOT_CA_pem_end");
-
-/* Firebase config */
-extern const char firebase_config_json_start[] asm("_binary_firebase_config_json_start");
-extern const char firebase_config_json_end[] asm("_binary_firebase_config_json_end");
 
 /*=============================================================================
  *                             STATIC STATE & TAGS
@@ -370,55 +371,24 @@ bool get_json_string(const cJSON *root, const char *key, char *out_buf, size_t b
  */
 void send_sensor_data_to_firestore(float temp, float hum)
 {
-    // pull in firebase configuration from JSON file
-    size_t len = firebase_config_json_end - firebase_config_json_start;
-    char *buf = malloc(len + 1);
-    if (!buf)
-    {
-        ESP_LOGE(TAG, "Out of memory");
-        return;
-    }
-    memcpy(buf, firebase_config_json_start, len);
-    buf[len] = '\0'; // null‑terminate
 
-    // Parse with cJSON
-    cJSON *root = cJSON_Parse(buf);
-    free(buf);
-    if (!root)
-    {
-        ESP_LOGE(TAG, "JSON parse error");
-        return;
-    }
-
-    ESP_LOGI(TAG, "parsed config JSON");
-    UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGI(TAG, "Sub task stack remaining: %u bytes", watermark);
-
-    // extract svc_acct_email from config
+    // extract svc_acct_email from nvs_config
     char svc_acct_email[SVC_ACCT_EMAIL_SIZE];
-    if (!get_json_string(root, "svc_acct_email", svc_acct_email, sizeof(svc_acct_email)))
+    if (!load_config_str("svs_acct_email", svc_acct_email, SVC_ACCT_EMAIL_SIZE - 1, "default-config"))
     {
         ESP_LOGE(TAG, "Failed to get svc_acct_email");
         return;
     }
+    ESP_LOGI(TAG, "loaded svc_acct_email");
 
-    ESP_LOGI(TAG, "extracted svc_acct_email");
-    watermark = uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGI(TAG, "Sub task stack remaining: %u bytes", watermark);
-
-    // extract proj_id from config
+    // extract proj_id from nvs_config
     char proj_id[PROJ_ID_SIZE];
-    if (!get_json_string(root, "project_id", proj_id, sizeof(proj_id)))
+    if (!load_config_str("proj_id", proj_id, PROJ_ID_SIZE - 1, "default-config"))
     {
         ESP_LOGE(TAG, "Failed to get project_id");
         return;
     }
-
     ESP_LOGI(TAG, "extracted proj_id");
-    watermark = uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGI(TAG, "Sub task stack remaining: %u bytes", watermark);
-
-    cJSON_Delete(root);
 
 // get access token
 #define TOKEN_SIZE 1200

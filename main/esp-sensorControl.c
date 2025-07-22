@@ -22,6 +22,7 @@
 #include "mqtt_client.h"
 #include "ahtxx.h"
 #include "firebase.h"
+#include "nvs_helper.h"
 
 // === Defines ===
 #define GOT_IP_BIT BIT0
@@ -285,6 +286,8 @@ void ethernet_init()
 void app_main(void)
 {
     ESP_LOGI(TAG_ETH, "Starting app_main");
+    ESP_LOGI("NVS", "Initialize NVS");
+    init_nvs();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ethernet_init();
 
