@@ -26,9 +26,9 @@
 // === Defines ===
 #define GOT_IP_BIT BIT0
 #define STACK_SIZE 10240
-#define SAMPLE_INTERVAL_MS    5000    // read sensor every 5 s
-#define WINDOW_INTERVAL_MS   60000    // average window = 60 s
-#define BATCH_SIZE               5
+#define SAMPLE_INTERVAL_MS 5000  // read sensor every 5 s
+#define WINDOW_INTERVAL_MS 60000 // average window = 60 s
+#define BATCH_SIZE 5
 
 // === Logging Tags ===
 static const char *TAG_ETH = "ETH";
@@ -45,14 +45,15 @@ static float window_sum;
 static uint32_t window_count;
 
 /* Structure for holding an averaged reading */
-typedef struct {
+typedef struct
+{
     time_t timestamp;
-    float  average;
+    float average;
 } avg_sample_t;
 
 /* Simple in-RAM circular buffer for a batch of averages */
 static avg_sample_t batch_buffer[BATCH_SIZE];
-static uint8_t      batch_index;
+static uint8_t batch_index;
 
 /* Forward declarations */
 static void sample_timer_cb(TimerHandle_t xTimer);
@@ -64,12 +65,13 @@ void setup_averaging(void)
 {
     TimerHandle_t sample_timer = xTimerCreate(
         "sampleTimer", pdMS_TO_TICKS(SAMPLE_INTERVAL_MS),
-        pdTRUE,  NULL, sample_timer_cb);
+        pdTRUE, NULL, sample_timer_cb);
     TimerHandle_t window_timer = xTimerCreate(
         "windowTimer", pdMS_TO_TICKS(WINDOW_INTERVAL_MS),
-        pdTRUE,  NULL, window_timer_cb);
+        pdTRUE, NULL, window_timer_cb);
 
-    if (sample_timer == NULL || window_timer == NULL) {
+    if (sample_timer == NULL || window_timer == NULL)
+    {
         ESP_LOGE(TAG, "Timer creation failed");
         return;
     }
@@ -87,12 +89,15 @@ static void sample_timer_cb(TimerHandle_t xTimer)
 {
     esp_err_t err = ahtxx_get_measurement(dev_hdl, &temperature, &humidity);
 
-    if (err == ESP_OK) {
-        window_sum   += (temperature * 9.0/5.0) + 32.0;
+    if (err == ESP_OK)
+    {
+        window_sum += (temperature * 9.0 / 5.0) + 32.0;
         window_count += 1;
-        ESP_LOGD(TAG, "Sampled: %.2f  (sum=%.2f count=%"PRIu32")",
+        ESP_LOGD(TAG, "Sampled: %.2f  (sum=%.2f count=%" PRIu32 ")",
                  temperature, window_sum, window_count);
-    } else {
+    }
+    else
+    {
         ESP_LOGW(TAG, "Sensor read failed: %s", esp_err_to_name(err));
     }
 }
@@ -107,28 +112,30 @@ static void sample_timer_cb(TimerHandle_t xTimer)
  * ------------------------------------------------------------------------- */
 static void window_timer_cb(TimerHandle_t xTimer)
 {
-    if (window_count == 0) {
+    if (window_count == 0)
+    {
         ESP_LOGW(TAG, "No samples in this window");
         return;
     }
 
     /* Compute average and reset */
     float avg = window_sum / (float)window_count;
-    window_sum   = 0;
+    window_sum = 0;
     window_count = 0;
 
     /* Record timestamped average */
     time_t now = time(NULL);
     batch_buffer[batch_index].timestamp = now;
-    batch_buffer[batch_index].average   = avg;
+    batch_buffer[batch_index].average = avg;
     batch_index++;
 
     ESP_LOGI(TAG, "Window avg: %.2f at %lld  (buffer=%u/%u)",
              avg, (long long)now, batch_index, BATCH_SIZE);
 
     /* If we’ve collected enough, send them */
-    if (batch_index >= BATCH_SIZE) {
-        //send_batch();
+    if (batch_index >= BATCH_SIZE)
+    {
+        // send_batch();
         batch_index = 0;
     }
 }
@@ -164,6 +171,14 @@ void obtain_time(void)
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_init();
+    // Switch to “smooth” mode to slewing‐adjust the clock
+    esp_sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
+
+    // Re‑sync every hour (3600s), in milliseconds
+    esp_sntp_set_sync_interval(3600 * 1000);
+
+    // setup callback to notify of time-sync
+    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
 
     time_t now = 0;
     struct tm timeinfo = {0};
@@ -186,6 +201,13 @@ void obtain_time(void)
     {
         ESP_LOGI(TAG_NTP, "System time set successfully");
     }
+}
+
+// === time sync callback ===
+void time_sync_notification_cb(struct timeval *tv)
+{
+    time_t now = time(NULL);
+    ESP_LOGI("SNTP_CB", "Time synchronized: %s", ctime(&now));
 }
 
 // === Task: Post-IP Setup ===
@@ -225,9 +247,9 @@ void post_ip_task(void *pvParameters)
     // Read and log temperature/humidity
     esp_err_t err = ahtxx_get_measurement(dev_hdl, &temperature, &humidity);
     ESP_LOGI(TAG_AHT, "Temperature: %.2f C, Humidity: %.2f %%", temperature, humidity);
-    //send_sensor_data_to_firestore(temperature, humidity);
-    // TODO Upload to Firebase
-    // firebase_upload_temperature(temperature, humidity);
+    // send_sensor_data_to_firestore(temperature, humidity);
+    //  TODO Upload to Firebase
+    //  firebase_upload_temperature(temperature, humidity);
     setup_averaging();
     vTaskDelete(NULL);
 }
