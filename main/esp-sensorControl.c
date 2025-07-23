@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -178,6 +179,13 @@ void obtain_time(void)
     // Re‑sync every hour (3600s), in milliseconds
     esp_sntp_set_sync_interval(3600 * 1000);
 
+    // === time sync callback ===
+    void time_sync_notification_cb(struct timeval *tv)
+{
+    time_t now = time(NULL);
+    ESP_LOGI("SNTP_CB", "Time synchronized: %s", ctime(&now));
+}
+
     // setup callback to notify of time-sync
     esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
 
@@ -204,12 +212,7 @@ void obtain_time(void)
     }
 }
 
-// === time sync callback ===
-void time_sync_notification_cb(struct timeval *tv)
-{
-    time_t now = time(NULL);
-    ESP_LOGI("SNTP_CB", "Time synchronized: %s", ctime(&now));
-}
+
 
 // === Task: Post-IP Setup ===
 void post_ip_task(void *pvParameters)
@@ -227,25 +230,26 @@ void post_ip_task(void *pvParameters)
     // Startup MQTT
     static bool have_all_config = true;
 
-    static const char *mqtt_url[BROKER_URL_SIZE];
+    char mqtt_url[BROKER_URL_SIZE];
+    mqtt_url[0] = '\0';
     if (!load_config_str("mqtt_url", mqtt_url, BROKER_URL_SIZE - 1, "default-config"))
     {
         have_all_config = false;
     }
 
-    static const char *mqtt_username[MQTT_USERNAME_SIZE];
+    char mqtt_username[MQTT_USERNAME_SIZE] = {0};
     if (!load_config_str("mqtt_username", mqtt_username, MQTT_USERNAME_SIZE - 1, "default-config"))
     {
         have_all_config = false;
     }
 
-    static const char *mqtt_password[MQTT_PASSWORD_SIZE];
+    char mqtt_password[MQTT_PASSWORD_SIZE];
     if (load_config_str("mqtt_password", mqtt_password, MQTT_PASSWORD_SIZE - 1, "default-config"))
     {
         have_all_config = false;
     }
 
-    static const char *verification_cert[MQTT_CERT_SIZE];
+    char verification_cert[MQTT_CERT_SIZE];
     if (load_config_str("verification_cert", verification_cert, MQTT_CERT_SIZE - 1, "default-config"))
     {
         have_all_config = false;

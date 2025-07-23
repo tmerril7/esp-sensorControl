@@ -67,7 +67,7 @@ extern const char G_ROOT_CA_pem_end[] asm("_binary_G_ROOT_CA_pem_end");
 
 static const char *TAG = "FIREBASE";
 static char cached_token[1200] = {0};
-static time_t chached_expiry = 0;
+static time_t cached_expiry = 0;
 
 /*=============================================================================
  *                         FORWARD DECLARATIONS
@@ -332,7 +332,7 @@ esp_err_t firebase_get_access_token(char *out_token, size_t max_len, char *svc_a
     }
     else
     {
-        cached_expiry = now + (time_t)token_item_expire_in->valuedouble;
+        cached_expiry = now + (time_t)token_item_expires_in->valuedouble;
     }
     cJSON_Delete(resp_json);
     cJSON_Delete(token_item_token);
@@ -453,8 +453,7 @@ void send_sensor_data_to_firestore(float temp, float hum)
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     ESP_LOGI(TAG, "Set first header");
-    watermark = uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGI(TAG, "Setting Headers ----Sub task stack remaining: %u bytes", watermark);
+
     if (esp_http_client_set_header(client, "Authorization", auth_header) != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to set first header");
@@ -466,8 +465,6 @@ void send_sensor_data_to_firestore(float temp, float hum)
         ESP_LOGE(TAG, "Failed to set second header");
     }
     // ***Delete? esp_http_client_set_post_field(client, json_str, strlen(json_str));
-    watermark = uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGI(TAG, "Opening connections ----Sub task stack remaining: %u bytes", watermark);
 
     esp_err_t err = esp_http_client_open(client, strlen(json_str));
 
@@ -476,9 +473,6 @@ void send_sensor_data_to_firestore(float temp, float hum)
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
         return;
     }
-
-    watermark = uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGI(TAG, "Writing request----Sub task stack remaining: %u bytes", watermark);
 
     int wlen = esp_http_client_write(client, json_str, strlen(json_str));
     if (wlen <= 0)

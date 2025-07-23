@@ -16,6 +16,39 @@
 
 static const char *TAG = "NVS_HELPER";
 
+#define BUF_LEN 128
+#define PROMPT_BUF_SIZE 64
+
+void prompt_and_save(const char *key, const char *prompt)
+{
+    char buf[BUF_LEN];
+
+    // 1) Prompt the user
+    printf("%s: ", prompt);
+    fflush(stdout);
+
+    // 2) Read a line from stdin (UART0)
+    if (fgets(buf, sizeof(buf), stdin) == NULL)
+    {
+        printf("\nError reading input\n");
+        return;
+    }
+
+    // 3) Strip trailing newline
+    buf[strcspn(buf, "\r\n")] = '\0';
+
+    // 4) Save to NVS
+    esp_err_t err = save_config_str(key, buf);
+    if (err == ESP_OK)
+    {
+        printf("Saved '%s' = \"%s\"\n", key, buf);
+    }
+    else
+    {
+        printf("Error saving '%s' (%s)\n", key, esp_err_to_name(err));
+    }
+}
+
 /**
  * @brief Initialize the NVS flash partition.
  *
@@ -27,7 +60,7 @@ static const char *TAG = "NVS_HELPER";
  *   - ESP_OK on success
  *   - Otherwise, an error code (logged via ESP_ERROR_CHECK).
  */
-void init_nvs(void)
+esp_err_t init_nvs(void)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -39,6 +72,7 @@ void init_nvs(void)
     }
     ESP_ERROR_CHECK(err);
     ESP_LOGI(TAG, "NVS initialized");
+    return ESP_OK;
 }
 
 /**
@@ -72,7 +106,7 @@ esp_err_t save_config_int(const char *key, int32_t value)
 
     if (err == ESP_OK)
     {
-        ESP_LOGI(TAG, "Saved int '%s' = %d", key, value);
+        ESP_LOGI(TAG, "Saved int '%s' = %" PRIu32, key, value);
     }
     else
     {
@@ -96,7 +130,7 @@ int32_t load_config_int(const char *key, int32_t default_value)
     esp_err_t err = nvs_open("storage", NVS_READONLY, &handle);
     if (err != ESP_OK)
     {
-        ESP_LOGW(TAG, "nvs_open failed, using default %d", default_value);
+        ESP_LOGW(TAG, "nvs_open failed, using default %" PRIu32, default_value);
         return default_value;
     }
 
@@ -106,12 +140,12 @@ int32_t load_config_int(const char *key, int32_t default_value)
 
     if (err == ESP_OK)
     {
-        ESP_LOGI(TAG, "Loaded int '%s' = %d", key, value);
+        ESP_LOGI(TAG, "Loaded int '%s' = %" PRIu32, key, value);
         return value;
     }
     else
     {
-        ESP_LOGW(TAG, "Key '%s' not set, using default %d", key, default_value);
+        ESP_LOGW(TAG, "Key '%s' not set, using default %" PRIu32, key, default_value);
         return default_value;
     }
 }
@@ -183,6 +217,12 @@ bool load_config_str(const char *key, char *out_buf, size_t buf_len, const char 
     // Get required length
     size_t required = 0;
     err = nvs_get_str(handle, key, NULL, &required);
+    if (err != ESP_OK)
+    {
+        char prompt_buf[PROMPT_BUF_SIZE];
+        snprintf(prompt_buf, PROMPT_BUF_SIZE - 1, "Enter value for %s", key);
+        prompt_and_save(key, prompt_buf);
+    }
     if (err != ESP_OK || required == 0 || required > buf_len)
     {
         ESP_LOGW(TAG, "Key '%s' missing or too large, using default \"%s\"", key, default_str);
