@@ -14,40 +14,11 @@
 #include "esp_log.h"
 #include "esp_err.h"
 
+#include "esp_console.h"
+#include "linenoise/linenoise.h"
+#include "argtable3/argtable3.h"
+
 static const char *TAG = "NVS_HELPER";
-
-#define BUF_LEN 128
-#define PROMPT_BUF_SIZE 64
-
-void prompt_and_save(const char *key, const char *prompt)
-{
-    char buf[BUF_LEN];
-
-    // 1) Prompt the user
-    printf("%s: ", prompt);
-    fflush(stdout);
-
-    // 2) Read a line from stdin (UART0)
-    if (fgets(buf, sizeof(buf), stdin) == NULL)
-    {
-        printf("\nError reading input\n");
-        return;
-    }
-
-    // 3) Strip trailing newline
-    buf[strcspn(buf, "\r\n")] = '\0';
-
-    // 4) Save to NVS
-    esp_err_t err = save_config_str(key, buf);
-    if (err == ESP_OK)
-    {
-        printf("Saved '%s' = \"%s\"\n", key, buf);
-    }
-    else
-    {
-        printf("Error saving '%s' (%s)\n", key, esp_err_to_name(err));
-    }
-}
 
 /**
  * @brief Initialize the NVS flash partition.
@@ -72,7 +43,50 @@ esp_err_t init_nvs(void)
     }
     ESP_ERROR_CHECK(err);
     ESP_LOGI(TAG, "NVS initialized");
-    return ESP_OK;
+    return err;
+}
+
+void init_nvs_console(int args, int length)
+{
+    esp_console_config_t console_config = {
+        .max_cmdline_args = args,
+        .max_cmdline_length = length,
+        .hint_color = atoi(LOG_COLOR_CYAN)} ESP_ERROR_CHECK(esp_console_init(&console_config));
+    linenoiseSetMultiline(1);
+
+    set_args.key = arg_str1(NULL, NULL, "<key>", "NVS key");
+    set_args.value = arg_str1(NULL, NULL, "<value>", "String value");
+    set_args.end = arg_end(2);
+    const esp_console_cmd_t set_cmd = {
+        .command = "set",
+        .help = "set <key> <value> in NVS",
+        .hint = NULL,
+        .func = &cmd_set,
+        .argtable = &set_args};
+    ESP_ERROR_CHECK(esp_console_cmd_register(&set_cmd));
+
+    // 5) Start REPL loop
+    printf("\nESP32 Console ready. Type 'help' to list commands.\n\n");
+
+    while (true)
+    {
+        char *line = linenoise("esp> ");
+        if (line == NULL)
+        {
+            continue;
+        } // e.g., Ctrl+D
+
+        // Add to history if non-empty
+        if (line[0] != '\0')
+        {
+            linenoiseHistoryAdd(line);
+        }
+
+        // Run the command
+        int ret;
+        esp_console_run(line, &ret);
+        linenoiseFree(line);
+    }
 }
 
 /**
@@ -217,12 +231,7 @@ bool load_config_str(const char *key, char *out_buf, size_t buf_len, const char 
     // Get required length
     size_t required = 0;
     err = nvs_get_str(handle, key, NULL, &required);
-    if (err != ESP_OK)
-    {
-        char prompt_buf[PROMPT_BUF_SIZE];
-        snprintf(prompt_buf, PROMPT_BUF_SIZE - 1, "Enter value for %s", key);
-        prompt_and_save(key, prompt_buf);
-    }
+
     if (err != ESP_OK || required == 0 || required > buf_len)
     {
         ESP_LOGW(TAG, "Key '%s' missing or too large, using default \"%s\"", key, default_str);
@@ -246,4 +255,63 @@ bool load_config_str(const char *key, char *out_buf, size_t buf_len, const char 
         strlcpy(out_buf, default_str, buf_len);
         return false;
     }
+}
+
+/*----------------------------------------------------------
+ * 'set' command: set <key> <value>
+ *----------------------------------------------------------*/
+
+static struct
+{
+    struct arg_str *key;
+    struct arg_str *value;
+    struct arg_end *end;
+} set_args;
+
+static int cmd_set(int argc, char **argv)
+{
+    int ret = arg_parse(argc, argv, (void **)&set_args);
+    if (ret != 0)
+    {
+        arg_print_errors(stdout, set_args.end, argv[0]);
+        return 1;
+    }
+    const char *key = set_args.key->sval[0];
+    const char *value = set_args.value->sval[0];
+    esp_err_t err = save_config_str(key, value);
+    if (err == ESP_OK)
+    {
+        printf("Saved '%s' = \"%s\"\n", key, value);
+    }
+    else
+    {
+        printf("Error saving '%s': %s\n", key, esp_err_to_name(err));
+    }
+    return 0;
+}
+
+/*----------------------------------------------------------
+ * 'get' command: get <key> [<default>]
+ *----------------------------------------------------------*/
+static struct
+{
+    struct arg_str *key;
+    struct arg_str *def;
+    struct arg_end *end;
+} get_args;
+
+static int cmd_get(int argc, char **argv)
+{
+    int ret = arg_parse(argc, argv, (void **)&get_args);
+    if (ret != 0)
+    {
+        arg_print_errors(stdout, get_args.end, argv[0]);
+        return 1;
+    }
+    const char *key = get_args.key->sval[0];
+    const char *def = get_args.def->sval[0];
+    char buf[128];
+    bool ok = load_config_str(key, buf, sizeof(buf), def);
+    printf("%s: \"%s\" (%s)\n", key, buf, ok ? "loaded" : "default");
+    return 0;
 }

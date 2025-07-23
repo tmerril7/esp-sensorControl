@@ -180,11 +180,11 @@ void obtain_time(void)
     esp_sntp_set_sync_interval(3600 * 1000);
 
     // === time sync callback ===
-    void time_sync_notification_cb(struct timeval *tv)
-{
-    time_t now = time(NULL);
-    ESP_LOGI("SNTP_CB", "Time synchronized: %s", ctime(&now));
-}
+    void time_sync_notification_cb(struct timeval * tv)
+    {
+        time_t now = time(NULL);
+        ESP_LOGI("SNTP_CB", "Time synchronized: %s", ctime(&now));
+    }
 
     // setup callback to notify of time-sync
     esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
@@ -211,8 +211,6 @@ void obtain_time(void)
         ESP_LOGI(TAG_NTP, "System time set successfully");
     }
 }
-
-
 
 // === Task: Post-IP Setup ===
 void post_ip_task(void *pvParameters)
@@ -324,6 +322,7 @@ void app_main(void)
     ESP_LOGI(TAG_ETH, "Starting app_main");
     ESP_LOGI("NVS", "Initialize NVS");
     init_nvs();
+    init_nvs_console();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ethernet_init();
 
