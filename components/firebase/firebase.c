@@ -53,13 +53,8 @@
  *                           EXTERNALLY EMBEDDED KEYS
  *============================================================================*/
 
-/* Private key PEM (–start/–end markers come from your CMake embed) */
-extern const char FIREBASE_SYSTEM_KEY_pem_start[] asm("_binary_FIREBASE_SYSTEM_KEY_pem_start");
-extern const char FIREBASE_SYSTEM_KEY_pem_end[] asm("_binary_FIREBASE_SYSTEM_KEY_pem_end");
-
-/* CA certificates for TLS */
-extern const char G_ROOT_CA_pem_start[] asm("_binary_G_ROOT_CA_pem_start");
-extern const char G_ROOT_CA_pem_end[] asm("_binary_G_ROOT_CA_pem_end");
+// temp fix
+const char *firebase_key = "temp";
 
 /*=============================================================================
  *                             STATIC STATE & TAGS
@@ -103,8 +98,8 @@ static esp_err_t _sign_jwt_rs256(const char *header_payload,
 
     /* Parse the service account private key */
     int ret = mbedtls_pk_parse_key(&pk,
-                                   (const unsigned char *)FIREBASE_SYSTEM_KEY_pem_start,
-                                   FIREBASE_SYSTEM_KEY_pem_end - FIREBASE_SYSTEM_KEY_pem_start,
+                                   (const unsigned char *)firebase_key,
+                                   0,
                                    NULL, 0, _mbedtls_rng, NULL);
     if (ret)
     {
@@ -249,7 +244,7 @@ esp_err_t firebase_get_access_token(char *out_token, size_t max_len, char *svc_a
     esp_http_client_config_t config = {
         .url = TOKEN_URL,
         .timeout_ms = 5000,
-        .cert_pem = G_ROOT_CA_pem_start,
+        .cert_pem = firebase_key,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_method(client, HTTP_METHOD_POST);
@@ -446,7 +441,7 @@ void send_sensor_data_to_firestore(float temp, float hum)
     /* Perform HTTP POST */
     esp_http_client_config_t config = {
         .url = url,
-        .cert_pem = G_ROOT_CA_pem_start,
+        .cert_pem = firebase_key,
         .timeout_ms = 5000,
         .buffer_size_tx = 2048,
         .buffer_size = 2048};

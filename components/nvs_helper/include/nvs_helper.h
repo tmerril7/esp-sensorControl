@@ -51,4 +51,6 @@ bool load_config_str(const char *key,
                      size_t buf_len,
                      const char *default_str);
 
+// void init_nvs_console(int args, int length);
+
 #endif // CONFIG_NVS_H

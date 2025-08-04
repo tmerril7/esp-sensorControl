@@ -13,7 +13,9 @@
 #include "nvs.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_system.h"
 
+#include "esp_vfs_dev.h"
 #include "esp_console.h"
 #include "linenoise/linenoise.h"
 #include "argtable3/argtable3.h"
@@ -44,49 +46,6 @@ esp_err_t init_nvs(void)
     ESP_ERROR_CHECK(err);
     ESP_LOGI(TAG, "NVS initialized");
     return err;
-}
-
-void init_nvs_console(int args, int length)
-{
-    esp_console_config_t console_config = {
-        .max_cmdline_args = args,
-        .max_cmdline_length = length,
-        .hint_color = atoi(LOG_COLOR_CYAN)} ESP_ERROR_CHECK(esp_console_init(&console_config));
-    linenoiseSetMultiline(1);
-
-    set_args.key = arg_str1(NULL, NULL, "<key>", "NVS key");
-    set_args.value = arg_str1(NULL, NULL, "<value>", "String value");
-    set_args.end = arg_end(2);
-    const esp_console_cmd_t set_cmd = {
-        .command = "set",
-        .help = "set <key> <value> in NVS",
-        .hint = NULL,
-        .func = &cmd_set,
-        .argtable = &set_args};
-    ESP_ERROR_CHECK(esp_console_cmd_register(&set_cmd));
-
-    // 5) Start REPL loop
-    printf("\nESP32 Console ready. Type 'help' to list commands.\n\n");
-
-    while (true)
-    {
-        char *line = linenoise("esp> ");
-        if (line == NULL)
-        {
-            continue;
-        } // e.g., Ctrl+D
-
-        // Add to history if non-empty
-        if (line[0] != '\0')
-        {
-            linenoiseHistoryAdd(line);
-        }
-
-        // Run the command
-        int ret;
-        esp_console_run(line, &ret);
-        linenoiseFree(line);
-    }
 }
 
 /**
@@ -223,7 +182,7 @@ bool load_config_str(const char *key, char *out_buf, size_t buf_len, const char 
     esp_err_t err = nvs_open("storage", NVS_READONLY, &handle);
     if (err != ESP_OK)
     {
-        ESP_LOGW(TAG, "nvs_open failed, using default \"%s\"", default_str);
+        ESP_LOGW(TAG, "nvs_open failed (%s), using default \"%s\"", key, default_str);
         strlcpy(out_buf, default_str, buf_len);
         return false;
     }
@@ -315,3 +274,31 @@ static int cmd_get(int argc, char **argv)
     printf("%s: \"%s\" (%s)\n", key, buf, ok ? "loaded" : "default");
     return 0;
 }
+
+// void init_nvs_console(int args, int length)
+// {
+
+//     esp_console_repl_t *repl = NULL;
+//     esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+//     repl_config.task_stack_size = 1024 * 8;
+//     repl_config.prompt = "Console>";
+//     repl_config.max_cmdline_length = 2048;
+//     esp_console_dev_usb_cdc_config_t hw_config = ESP_CONSOLE_DEV_CDC_CONFIG_DEFAULT();
+//     ESP_ERROR_CHECK(esp_console_new_repl_usb_cdc(&hw_config, &repl_config, &repl));
+
+//     set_args.key = arg_str1(NULL, NULL, "<key>", "NVS key");
+//     set_args.value = arg_str1(NULL, NULL, "<value>", "String value");
+//     set_args.end = arg_end(2);
+//     const esp_console_cmd_t set_cmd = {
+//         .command = "set",
+//         .help = "set <key> <value> in NVS",
+//         .hint = NULL,
+//         .func = &cmd_set,
+//         .argtable = &set_args};
+//     ESP_ERROR_CHECK(esp_console_cmd_register(&set_cmd));
+
+//     // 5) Start REPL loop
+//     printf("\nESP32 Console ready. Type 'help' to list commands.\n\n");
+
+//     ESP_ERROR_CHECK(esp_console_start_repl(repl));
+// }

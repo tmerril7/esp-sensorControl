@@ -4,7 +4,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <dirent.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -17,13 +17,15 @@
 #include "esp_netif.h"
 #include "esp_eth.h"
 #include "esp_sntp.h"
-
+#include "esp_partition.h"
 #include "ethernet_init.h"
 #include "mqtt_man.h"
 #include "mqtt_client.h"
 #include "ahtxx.h"
 #include "firebase.h"
 #include "nvs_helper.h"
+#include "usb_helper.h"
+#include "esp_console.h"
 
 // === Defines ===
 #define GOT_IP_BIT BIT0
@@ -31,6 +33,10 @@
 #define SAMPLE_INTERVAL_MS 5000  // read sensor every 5 s
 #define WINDOW_INTERVAL_MS 60000 // average window = 60 s
 #define BATCH_SIZE 5
+#define BASE_PATH "/littlefs" // base path to mount the partition
+
+#define EPNUM_MSC 1
+#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_MSC_DESC_LEN)
 
 // === Logging Tags ===
 static const char *TAG_ETH = "ETH";
@@ -38,6 +44,7 @@ static const char *TAG_NTP = "SNTP";
 static const char *TAG_AHT = "AHTSensor";
 static const char *TAG_POSTIP = "PostIPTask";
 static const char *TAG = "Averaging";
+static const char *TAG_USB = "Averaging";
 
 // === Globals ===
 static EventGroupHandle_t eth_event_group;
@@ -45,6 +52,7 @@ ahtxx_handle_t dev_hdl;
 float temperature, humidity;
 static float window_sum;
 static uint32_t window_count;
+static const char *config_path = "/data/cfg.json";
 
 /* Structure for holding an averaged reading */
 typedef struct
@@ -227,35 +235,44 @@ void post_ip_task(void *pvParameters)
 
     // Startup MQTT
     static bool have_all_config = true;
-
-    char mqtt_url[BROKER_URL_SIZE];
-    mqtt_url[0] = '\0';
-    if (!load_config_str("mqtt_url", mqtt_url, BROKER_URL_SIZE - 1, "default-config"))
+    char *mqtt_url = load_config_from_fat(config_path, "mqtt_url");
+    if (!mqtt_url)
     {
+        ESP_LOGE("CONFIG_HELPER", "Did not load mqtt_url");
         have_all_config = false;
     }
 
-    char mqtt_username[MQTT_USERNAME_SIZE] = {0};
-    if (!load_config_str("mqtt_username", mqtt_username, MQTT_USERNAME_SIZE - 1, "default-config"))
+    char *mqtt_password = load_config_from_fat(config_path, "mqtt_password");
+    if (!mqtt_password)
     {
+        ESP_LOGE("CONFIG_HELPER", "Did not load mqtt_password");
         have_all_config = false;
     }
 
-    char mqtt_password[MQTT_PASSWORD_SIZE];
-    if (load_config_str("mqtt_password", mqtt_password, MQTT_PASSWORD_SIZE - 1, "default-config"))
+    char *mqtt_username = load_config_from_fat(config_path, "mqtt_username");
+    if (!mqtt_username)
     {
+        ESP_LOGE("CONFIG_HELPER", "Did not load mqtt_username");
         have_all_config = false;
     }
 
-    char verification_cert[MQTT_CERT_SIZE];
-    if (load_config_str("verification_cert", verification_cert, MQTT_CERT_SIZE - 1, "default-config"))
+    char *mqtt_v_cert = load_config_from_fat(config_path, "mqtt_v_cert");
+    if (!mqtt_v_cert)
     {
+        ESP_LOGE("CONFIG_HELPER", "Did not load mqtt_v_cert");
         have_all_config = false;
     }
 
     if (have_all_config)
     {
-        mqtt_app_start(mqtt_url, mqtt_username, mqtt_password, verification_cert);
+        if (mqtt_app_start(mqtt_url, mqtt_username, mqtt_password, mqtt_v_cert) != ESP_OK)
+        {
+            ESP_LOGE(TAG_POSTIP, "MQTT failed to start");
+            free(mqtt_url);
+            free(mqtt_password);
+            free(mqtt_v_cert);
+            free(mqtt_username);
+        }
     }
 
     // Initialize AHT21 sensor
@@ -285,7 +302,7 @@ void post_ip_task(void *pvParameters)
     // send_sensor_data_to_firestore(temperature, humidity);
     //  TODO Upload to Firebase
     //  firebase_upload_temperature(temperature, humidity);
-    setup_averaging();
+    // setup_averaging();
     vTaskDelete(NULL);
 }
 
@@ -320,12 +337,16 @@ void ethernet_init()
 void app_main(void)
 {
     ESP_LOGI(TAG_ETH, "Starting app_main");
-    ESP_LOGI("NVS", "Initialize NVS");
-    init_nvs();
-    init_nvs_console();
+
+    // initialize flash msc, NVS, console, and mount storage
+    usb_helper_init();
+
+    // default loop
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    // initialize ethernet
     ethernet_init();
 
     // Start post-IP task
-    xTaskCreate(&post_ip_task, "post_ip_task", STACK_SIZE, NULL, 5, NULL);
+    xTaskCreate(&post_ip_task, "post_ip_task", STACK_SIZE, NULL, 4, NULL);
 }
