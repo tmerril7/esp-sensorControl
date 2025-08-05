@@ -32,7 +32,7 @@
 
 /* My modules*/
 #include "nvs_helper.h"
-
+#include "usb_helper.h"
 /*=============================================================================
  *                                CONSTANTS
  *============================================================================*/
@@ -53,9 +53,6 @@
  *                           EXTERNALLY EMBEDDED KEYS
  *============================================================================*/
 
-// temp fix
-const char *firebase_key = "temp";
-
 /*=============================================================================
  *                             STATIC STATE & TAGS
  *============================================================================*/
@@ -63,7 +60,8 @@ const char *firebase_key = "temp";
 static const char *TAG = "FIREBASE";
 static char cached_token[1200] = {0};
 static time_t cached_expiry = 0;
-
+static const char *config_path = "/data/cfg.json";
+#define COMMIT_URL_FMT "https://firestore.googleapis.com/v1/projects/%s/databases/(default)/documents:commit"
 /*=============================================================================
  *                         FORWARD DECLARATIONS
  *============================================================================*/
@@ -78,6 +76,16 @@ static esp_err_t _sign_jwt_rs256(const char *header_payload, char *out_sig_b64, 
  *                           PRIVATE HELPER FUNCTIONS
  *============================================================================*/
 
+void dump_hex16(const char *tag, const uint8_t *buf)
+{
+    printf("%s: ", tag);
+    for (int i = 0; i < 64; i++)
+    {
+        printf("%02X ", buf[i]);
+    }
+    printf("\n");
+}
+
 static int _mbedtls_rng(void *ctx, unsigned char *buf, size_t len)
 {
     (void)ctx;
@@ -89,7 +97,16 @@ static esp_err_t _sign_jwt_rs256(const char *header_payload,
                                  char *out_sig_b64,
                                  size_t sig_len)
 {
-
+    // get firebase_key from config
+    char *firebase_system_key = load_config_from_fat(config_path, "firebase_system_key");
+    if (!firebase_system_key)
+    {
+        ESP_LOGE("CONFIG_HELPER", "Did not load firebase_system_key");
+        return ESP_FAIL;
+    }
+    ESP_LOGI("firebase_stack", "firebase key length: %d", strlen(firebase_system_key));
+    ESP_LOGI("firebase_stack", "firebase key: %s", firebase_system_key);
+    dump_hex16("PEM_HEAD", (const uint8_t *)firebase_system_key);
     UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
     ESP_LOGI("firebase_stack", "Sub task stack remaining: %u bytes", watermark);
 
@@ -98,7 +115,7 @@ static esp_err_t _sign_jwt_rs256(const char *header_payload,
 
     /* Parse the service account private key */
     int ret = mbedtls_pk_parse_key(&pk,
-                                   (const unsigned char *)firebase_key,
+                                   (const unsigned char *)firebase_system_key,
                                    0,
                                    NULL, 0, _mbedtls_rng, NULL);
     if (ret)
@@ -107,7 +124,10 @@ static esp_err_t _sign_jwt_rs256(const char *header_payload,
         mbedtls_pk_free(&pk);
         return ESP_FAIL;
     }
+
+    free(firebase_system_key);
     ESP_LOGI(TAG, "key is parsed");
+
     watermark = uxTaskGetStackHighWaterMark(NULL);
     ESP_LOGI("firebase_stack", "Sub task stack remaining: %u bytes", watermark);
 
@@ -174,7 +194,7 @@ esp_err_t firebase_get_access_token(char *out_token, size_t max_len, char *svc_a
     /* -----check for existing token----- */
     if (cached_token[0] != '\0' && now < (cached_expiry - TOKEN_REFRESH_MARGIN))
     {
-        ESP_LOGD(TAG, "Reusing valid token, expires in %llds",
+        ESP_LOGI(TAG, "Reusing valid token, expires in %llds",
                  (long long)(cached_expiry - now));
         strlcpy(out_token, cached_token, max_len);
         return ESP_OK;
@@ -241,10 +261,17 @@ esp_err_t firebase_get_access_token(char *out_token, size_t max_len, char *svc_a
     cJSON_Delete(root);
 
     /* 6) Perform HTTP POST */
+    // get firebase_key from config
+    char *firebase_cert = load_config_from_fat(config_path, "G_ROOT_CA_CERT");
+    if (!firebase_cert)
+    {
+        ESP_LOGE("CONFIG_HELPER", "Did not load firebase_cert");
+        return ESP_FAIL;
+    }
     esp_http_client_config_t config = {
         .url = TOKEN_URL,
         .timeout_ms = 5000,
-        .cert_pem = firebase_key,
+        .cert_pem = firebase_cert,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_method(client, HTTP_METHOD_POST);
@@ -291,6 +318,8 @@ esp_err_t firebase_get_access_token(char *out_token, size_t max_len, char *svc_a
              esp_http_client_get_content_length(client));
     ESP_LOGI(TAG, "%s", response_buffer);
     esp_http_client_cleanup(client);
+
+    free(firebase_cert);
 
     /* 7) Parse JSON response */
     cJSON *resp_json = cJSON_Parse(response_buffer);
@@ -362,27 +391,41 @@ bool get_json_string(const cJSON *root, const char *key, char *out_buf, size_t b
 }
 
 /**
- * @brief  Send a single sensor reading to Firestore under `sensor_data` collection.
+ * @brief  Send a batch of readings to Firestore under `sensor_data` collection.
  */
-void send_sensor_data_to_firestore(float temp, float hum)
+esp_err_t send_sensor_data_to_firestore(const char *doc)
 {
 
     // extract svc_acct_email from nvs_config
-    char svc_acct_email[SVC_ACCT_EMAIL_SIZE];
-    if (!load_config_str("svs_acct_email", svc_acct_email, SVC_ACCT_EMAIL_SIZE - 1, "default-config"))
+    char *svc_acct_email = load_config_from_fat(config_path, "svc_acct_email");
+    if (!svc_acct_email)
     {
-        ESP_LOGE(TAG, "Failed to get svc_acct_email");
-        return;
+        ESP_LOGE("CONFIG_HELPER", "Did not load svc_acct_email");
+        return ESP_FAIL;
     }
+
+    // char svc_acct_email[SVC_ACCT_EMAIL_SIZE];
+    // if (!load_config_str("svs_acct_email", svc_acct_email, SVC_ACCT_EMAIL_SIZE - 1, "default-config"))
+    // {
+    //     ESP_LOGE(TAG, "Failed to get svc_acct_email");
+    //     return;
+    // }
     ESP_LOGI(TAG, "loaded svc_acct_email");
 
     // extract proj_id from nvs_config
-    char proj_id[PROJ_ID_SIZE];
-    if (!load_config_str("proj_id", proj_id, PROJ_ID_SIZE - 1, "default-config"))
+    char *proj_id = load_config_from_fat(config_path, "proj_id");
+    if (!proj_id)
     {
-        ESP_LOGE(TAG, "Failed to get project_id");
-        return;
+        ESP_LOGE("CONFIG_HELPER", "Did not load proj_id");
+        return ESP_FAIL;
     }
+
+    // char proj_id[PROJ_ID_SIZE];
+    // if (!load_config_str("proj_id", proj_id, PROJ_ID_SIZE - 1, "default-config"))
+    // {
+    //     ESP_LOGE(TAG, "Failed to get project_id");
+    //     return;
+    // }
     ESP_LOGI(TAG, "extracted proj_id");
 
 // get access token
@@ -391,8 +434,9 @@ void send_sensor_data_to_firestore(float temp, float hum)
     if (firebase_get_access_token(token, TOKEN_SIZE - 1, svc_acct_email) != ESP_OK)
     {
         ESP_LOGE(TAG, "Cannot obtain access token, aborting send");
-        return;
+        return ESP_FAIL;
     }
+    free(svc_acct_email);
 
     char *auth_header = malloc(TOKEN_SIZE - 20);
     snprintf(auth_header, TOKEN_SIZE - 20 - 1, "Bearer %s", token);
@@ -400,48 +444,20 @@ void send_sensor_data_to_firestore(float temp, float hum)
 
     /* Build Firestore REST endpoint URL */
     char url[256];
-    snprintf(url, sizeof(url),
-             "https://firestore.googleapis.com/v1/projects/%s/"
-             "databases/(default)/documents/sensor_data",
-             proj_id);
+    snprintf(url, sizeof(url), COMMIT_URL_FMT, proj_id);
+    free(proj_id);
 
-    /* Create Firestore document JSON */
-
-    time_t ts = time(NULL);
-
-    cJSON *doc = cJSON_CreateObject();
-    cJSON *fields = cJSON_AddObjectToObject(doc, "fields");
-
-    /* timestamp as integerValue */
-    char ts_str[32];
-    snprintf(ts_str, sizeof(ts_str), "%lld", (long long)ts);
-    cJSON *time_obj = cJSON_CreateObject();
-    cJSON_AddStringToObject(time_obj, "integerValue", ts_str);
-    cJSON_AddItemToObject(fields, "timestamp", time_obj);
-
-    /* temperature as doubleValue */
-    cJSON *val_obj = cJSON_CreateObject();
-    char val_str[16];
-    snprintf(val_str, sizeof(val_str), "%.2f", temp);
-    cJSON_AddStringToObject(val_obj, "doubleValue", val_str);
-    cJSON_AddItemToObject(fields, "temp", val_obj);
-
-    /* humidity as doubleValue*/
-    val_obj = cJSON_CreateObject();
-    snprintf(val_str, sizeof(val_str), "%.2f", hum);
-    cJSON_AddStringToObject(val_obj, "doubleValue", val_str);
-    cJSON_AddItemToObject(fields, "humidity", val_obj);
-
-#define SENSOR_DATA_SIZE 256
-    char *json_str = malloc(SENSOR_DATA_SIZE);
-    snprintf(json_str, SENSOR_DATA_SIZE - 1, "%s", cJSON_PrintUnformatted(doc));
-    cJSON_Delete(doc);
-    ESP_LOGI(TAG, "Sensor data: %s", json_str);
+    char *firebase_cert = load_config_from_fat(config_path, "G_ROOT_CA_CERT");
+    if (!firebase_cert)
+    {
+        ESP_LOGE("CONFIG_HELPER", "Did not load firebase_cert");
+        return ESP_FAIL;
+    }
 
     /* Perform HTTP POST */
     esp_http_client_config_t config = {
         .url = url,
-        .cert_pem = firebase_key,
+        .cert_pem = firebase_cert,
         .timeout_ms = 5000,
         .buffer_size_tx = 2048,
         .buffer_size = 2048};
@@ -461,19 +477,19 @@ void send_sensor_data_to_firestore(float temp, float hum)
     }
     // ***Delete? esp_http_client_set_post_field(client, json_str, strlen(json_str));
 
-    esp_err_t err = esp_http_client_open(client, strlen(json_str));
+    esp_err_t err = esp_http_client_open(client, strlen(doc));
 
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
-        return;
+        return ESP_FAIL;
     }
 
-    int wlen = esp_http_client_write(client, json_str, strlen(json_str));
+    int wlen = esp_http_client_write(client, doc, strlen(doc));
     if (wlen <= 0)
     {
         ESP_LOGE(TAG, "Write failed");
-        return;
+        return ESP_FAIL;
     }
     ESP_LOGI(TAG, "Wrote %u bytes", wlen);
 
@@ -491,13 +507,15 @@ void send_sensor_data_to_firestore(float temp, float hum)
     if (data_read <= 0)
     {
         ESP_LOGE(TAG, "Failed to read http request response");
-        return;
+        return ESP_FAIL;
     }
     ESP_LOGI(TAG, "read %u bytes", data_read);
     ESP_LOGI(TAG, "Status Code: %u", esp_http_client_get_status_code(client));
     esp_http_client_cleanup(client);
 
     free(auth_header);
-    free(json_str);
+
     free(firestore_resp_buffer);
+    free(firebase_cert);
+    return ESP_OK;
 }

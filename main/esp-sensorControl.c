@@ -26,13 +26,13 @@
 #include "nvs_helper.h"
 #include "usb_helper.h"
 #include "esp_console.h"
-
+#include "cJSON.h"
 // === Defines ===
 #define GOT_IP_BIT BIT0
 #define STACK_SIZE 10240
 #define SAMPLE_INTERVAL_MS 5000  // read sensor every 5 s
-#define WINDOW_INTERVAL_MS 60000 // average window = 60 s
-#define BATCH_SIZE 5
+#define WINDOW_INTERVAL_MS 15000 // average window = 60 s
+#define BATCH_SIZE 2
 #define BASE_PATH "/littlefs" // base path to mount the partition
 
 #define EPNUM_MSC 1
@@ -145,8 +145,66 @@ static void window_timer_cb(TimerHandle_t xTimer)
     /* If we’ve collected enough, send them */
     if (batch_index >= BATCH_SIZE)
     {
+        char *proj_id = load_config_from_fat(config_path, "proj_id");
+        if (!proj_id)
+        {
+            ESP_LOGE("CONFIG_HELPER", "Did not load proj_id");
+            return;
+        }
         // send_batch();
-        batch_index = 0;
+        cJSON *root = cJSON_CreateObject();
+        cJSON *writes = cJSON_AddArrayToObject(root, "writes");
+
+        for (uint8_t i = 0; i < batch_index; i++)
+        {
+            avg_sample_t *s = &batch_buffer[i];
+
+            // Document path: use timestamp as ID
+            char name[256];
+            snprintf(name, sizeof(name),
+                     "projects/%s/databases/(default)/documents/sensor_data/%lld",
+                     proj_id, (long long)s->timestamp);
+
+            // Build one write object
+            cJSON *write = cJSON_CreateObject();
+            cJSON *update = cJSON_AddObjectToObject(write, "update");
+            cJSON_AddStringToObject(update, "name", name);
+
+            // Build fields sub-object
+            cJSON *fields = cJSON_AddObjectToObject(update, "fields");
+
+            // timestamp field
+            char ts_str[32];
+            snprintf(ts_str, sizeof(ts_str), "%lld", (long long)s->timestamp);
+            cJSON *t = cJSON_CreateObject();
+            cJSON_AddStringToObject(t, "integerValue", ts_str);
+            cJSON_AddItemToObject(fields, "timestamp", t);
+
+            // value field
+            char val_str[32];
+            snprintf(val_str, sizeof(val_str), "%.2f", s->average);
+            cJSON *v = cJSON_CreateObject();
+            cJSON_AddStringToObject(v, "doubleValue", val_str);
+            cJSON_AddItemToObject(fields, "value", v);
+
+            // Tell Firestore to create/update
+            // (optional) you can add a precondition here if you need
+
+            cJSON_AddItemToArray(writes, write);
+        }
+        free(proj_id);
+        char *body = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        if (send_sensor_data_to_firestore(body) != ESP_OK)
+        {
+            ESP_LOGE("FIREBASE_HELPER", "failed to send to firestore");
+        }
+        else
+        {
+            batch_index = 0;
+        }
+
+        free(body);
     }
 }
 
@@ -302,7 +360,7 @@ void post_ip_task(void *pvParameters)
     // send_sensor_data_to_firestore(temperature, humidity);
     //  TODO Upload to Firebase
     //  firebase_upload_temperature(temperature, humidity);
-    // setup_averaging();
+    setup_averaging();
     vTaskDelete(NULL);
 }
 
