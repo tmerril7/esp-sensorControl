@@ -52,7 +52,6 @@
 /*=============================================================================
  *                           EXTERNALLY EMBEDDED KEYS
  *============================================================================*/
-
 /*=============================================================================
  *                             STATIC STATE & TAGS
  *============================================================================*/
@@ -104,9 +103,7 @@ static esp_err_t _sign_jwt_rs256(const char *header_payload,
         ESP_LOGE("CONFIG_HELPER", "Did not load firebase_system_key");
         return ESP_FAIL;
     }
-    ESP_LOGI("firebase_stack", "firebase key length: %d", strlen(firebase_system_key));
-    ESP_LOGI("firebase_stack", "firebase key: %s", firebase_system_key);
-    dump_hex16("PEM_HEAD", (const uint8_t *)firebase_system_key);
+
     UBaseType_t watermark = uxTaskGetStackHighWaterMark(NULL);
     ESP_LOGI("firebase_stack", "Sub task stack remaining: %u bytes", watermark);
 
@@ -114,10 +111,7 @@ static esp_err_t _sign_jwt_rs256(const char *header_payload,
     mbedtls_pk_init(&pk);
 
     /* Parse the service account private key */
-    int ret = mbedtls_pk_parse_key(&pk,
-                                   (const unsigned char *)firebase_system_key,
-                                   0,
-                                   NULL, 0, _mbedtls_rng, NULL);
+    int ret = mbedtls_pk_parse_key(&pk, (const unsigned char *)firebase_system_key, strlen(firebase_system_key) + 1, NULL, 0, _mbedtls_rng, NULL);
     if (ret)
     {
         ESP_LOGE(TAG, "Private key parse failed: %d", ret);
@@ -317,7 +311,6 @@ esp_err_t firebase_get_access_token(char *out_token, size_t max_len, char *svc_a
              esp_http_client_get_status_code(client),
              esp_http_client_get_content_length(client));
     ESP_LOGI(TAG, "%s", response_buffer);
-    esp_http_client_cleanup(client);
 
     free(firebase_cert);
 
@@ -327,40 +320,25 @@ esp_err_t firebase_get_access_token(char *out_token, size_t max_len, char *svc_a
     if (!resp_json)
     {
         ESP_LOGE(TAG, "Failed to parse token JSON");
+        esp_http_client_cleanup(client);
         return ESP_FAIL;
     }
     cJSON *token_item_token = cJSON_GetObjectItem(resp_json, "access_token");
-    if (!token_item_token)
-    {
-        ESP_LOGE(TAG, "No access_token in response");
-        cJSON_Delete(resp_json);
-        cJSON_Delete(token_item_token);
-        return ESP_FAIL;
-    }
     cJSON *token_item_expires_in = cJSON_GetObjectItem(resp_json, "expires_in");
-    if (!token_item_expires_in)
+    if (!cJSON_IsString(token_item_token) || !cJSON_IsNumber(token_item_expires_in))
     {
-        ESP_LOGE(TAG, "No expiration in response");
+        ESP_LOGE(TAG, "Unexpected JSON format");
         cJSON_Delete(resp_json);
-        cJSON_Delete(token_item_token);
-        cJSON_Delete(token_item_expires_in);
+        esp_http_client_cleanup(client);
         return ESP_FAIL;
     }
 
     strlcpy(cached_token, token_item_token->valuestring, max_len);
     strlcpy(out_token, cached_token, max_len);
-    if (!cJSON_IsNumber(token_item_expires_in))
-    {
-        ESP_LOGE(TAG, "response didn't have expires_in, couldn't save token");
-        cached_token[0] = '\0';
-    }
-    else
-    {
-        cached_expiry = now + (time_t)token_item_expires_in->valuedouble;
-    }
-    cJSON_Delete(resp_json);
-    cJSON_Delete(token_item_token);
-    cJSON_Delete(token_item_expires_in);
+    cached_expiry = now + (time_t)token_item_expires_in->valuedouble;
+
+    cJSON_Delete(resp_json); // only delete the root
+    esp_http_client_cleanup(client);
 
     ESP_LOGI(TAG, "Access token obtained successfully");
     return ESP_OK;

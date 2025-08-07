@@ -31,8 +31,8 @@
 #define GOT_IP_BIT BIT0
 #define STACK_SIZE 10240
 #define SAMPLE_INTERVAL_MS 5000  // read sensor every 5 s
-#define WINDOW_INTERVAL_MS 15000 // average window = 60 s
-#define BATCH_SIZE 2
+#define WINDOW_INTERVAL_MS 60000 // average window = 60 s
+#define BATCH_SIZE 5
 #define BASE_PATH "/littlefs" // base path to mount the partition
 
 #define EPNUM_MSC 1
